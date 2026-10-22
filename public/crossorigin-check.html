@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Clipr — crossOriginIsolated check</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        margin: 3rem auto;
+        max-width: 40rem;
+        padding: 0 1rem;
+        background: #0e0e11;
+        color: #e7e7ea;
+      }
+      h1 { font-size: 1.25rem; }
+      #result { font-size: 2rem; font-weight: 700; }
+      #result.pass { color: #4ade80; }
+      #result.fail { color: #f87171; }
+      #detail { color: #9a9aa3; word-break: break-word; }
+      a { color: #7dd3fc; }
+    </style>
+    <script>
+      // SPEC §14: window.crossOriginIsolated must be true on this response.
+      document.addEventListener('DOMContentLoaded', function () {
+        var ok = window.crossOriginIsolated === true;
+        var result = document.getElementById('result');
+        result.textContent = ok
+          ? 'PASS — crossOriginIsolated === true'
+          : 'FAIL — crossOriginIsolated === ' + String(window.crossOriginIsolated);
+        result.className = ok ? 'pass' : 'fail';
+        document.getElementById('detail').textContent =
+          'SharedArrayBuffer: ' +
+          (typeof SharedArrayBuffer !== 'undefined' ? 'available' : 'unavailable') +
+          ' · ' +
+          navigator.userAgent;
+      });
+    </script>
+  </head>
+  <body>
+    <h1>Clipr — COOP/COEP isolation check (SPEC §14)</h1>
+    <p id="result">checking…</p>
+    <p id="detail"></p>
+    <p>
+      This page must show <strong>PASS</strong> in every environment: local dev,
+      preview, and the deployed URL. If it shows FAIL, the isolation headers are
+      not being applied — see <code>public/_headers</code> and SPEC §14.
+    </p>
+  </body>
+</html>

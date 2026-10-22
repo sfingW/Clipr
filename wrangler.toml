@@ -1,0 +1,6 @@
+# Cloudflare Pages (SPEC §14) — static deploy, no runtime, no secrets.
+# Build command: vite build
+# Output directory: dist   (declared here for wrangler / Pages builds)
+name = "clipr"
+compatibility_date = "2026-10-22"
+pages_build_output_dir = "dist"
