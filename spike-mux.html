@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Clipr — mp4box mux spike</title>
+  </head>
+  <body>
+    <div id="root" class="spike">
+      <h1>mp4box mux spike</h1>
+      <p>
+        Standalone Phase-1 harness (SPEC §18: mp4box.js is the only muxer). Drops a source MP4,
+        runs the real pipeline — OPFS write → mp4box probe → WebCodecs decode → WebCodecs encode →
+        mp4box mux — then re-parses and decodes the output in-page to verify it.
+      </p>
+      <div class="spike__row">
+        <input id="file" type="file" accept="video/mp4,video/quicktime,.mp4,.m4v,.mov" />
+        <label>
+          start <input id="start" type="number" value="5" min="0" step="0.04" />
+        </label>
+        <label>
+          end <input id="end" type="number" value="15" min="0.2" step="0.04" />
+        </label>
+        <label title="Skip WebCodecs encode and run the §8.11 FFmpeg.wasm path (Safari fallback; also exercises the split-wasm reassembly)">
+          <input id="fallback" type="checkbox" />
+          force FFmpeg fallback
+        </label>
+        <button id="run" class="btn btn--primary" disabled>Run cut</button>
+      </div>
+      <div class="spike__row">
+        <a id="download" class="btn btn--success" style="display: none" download="spike-cut.mp4">
+          Download output
+        </a>
+        <span id="status"></span>
+      </div>
+      <pre id="log" class="spike__log"></pre>
+    </div>
+    <script type="module" src="/src/spike-mux-main.tsx"></script>
+  </body>
+</html>

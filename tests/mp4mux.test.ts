@@ -1,0 +1,427 @@
+/**
+ * Mux spike suite (SPEC §8.1, §8.10): proves the mp4box parse → window →
+ * mux → ffprobe-validated pipeline in Node, independent of the browser.
+ */
+import { beforeAll, describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  frameRateOf,
+  lastSyncIndexBefore,
+  locateMoov,
+  parseMoovBytes,
+  sampleIndexAtTime,
+  sampleRangeForWindow,
+  type ByteRangeReader,
+  type ParsedMp4,
+  type ParsedTrack,
+} from '../src/core/mp4Parse';
+import { buildEsdDescriptor, extractAscFromDescriptor, muxToMp4, type MuxSample } from '../src/core/mp4Mux';
+
+const nodeRequire = createRequire(import.meta.url);
+const ffmpegPath: string = nodeRequire('@ffmpeg-installer/ffmpeg').path;
+const ffprobePath: string = nodeRequire('@ffprobe-installer/ffprobe').path;
+
+const DIR = '/tmp/spike';
+const FRONT = `${DIR}/out_front.mp4`;
+const END = `${DIR}/out_end.mp4`;
+const LONG = `${DIR}/out_long.mp4`;
+const MUXED = `${DIR}/out_muxed.mp4`;
+const CUT = `${DIR}/out_cut.mp4`;
+
+function genFixture(out: string, duration: number, faststart: boolean): void {
+  const args = [
+    '-y',
+    '-v',
+    'error',
+    '-f',
+    'lavfi',
+    '-i',
+    `testsrc2=size=320x240:rate=25:duration=${duration}`,
+    '-f',
+    'lavfi',
+    '-i',
+    `sine=frequency=440:sample_rate=44100:duration=${duration}`,
+    '-ac',
+    '2',
+    '-c:v',
+    'libx264',
+    '-profile:v',
+    'high',
+    '-pix_fmt',
+    'yuv420p',
+    '-g',
+    '25',
+    '-bf',
+    '0',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '96k',
+  ];
+  if (faststart) args.push('-movflags', '+faststart');
+  args.push(out);
+  const r = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`ffmpeg fixture failed: ${r.stderr}`);
+}
+
+beforeAll(() => {
+  mkdirSync(DIR, { recursive: true });
+  if (!existsSync(FRONT)) genFixture(FRONT, 1, true);
+  if (!existsSync(END)) genFixture(END, 1, false);
+  if (!existsSync(LONG)) genFixture(LONG, 16, false);
+}, 120_000);
+
+function readerFor(absPath: string): ByteRangeReader {
+  const buf = readFileSync(absPath);
+  return async (offset, length) => new Uint8Array(buf.subarray(offset, offset + length));
+}
+
+interface Loaded {
+  parsed: ParsedMp4;
+  moovBytes: Uint8Array;
+  moovOffset: number;
+  reader: ByteRangeReader;
+}
+
+async function load(path: string): Promise<Loaded> {
+  const size = statSync(path).size;
+  const reader = readerFor(path);
+  const moov = await locateMoov(reader, size);
+  expect(moov, `moov not found in ${path}`).not.toBeNull();
+  const loc = moov!;
+  const moovBytes = await reader(loc.offset, loc.size);
+  const parsed = parseMoovBytes(moovBytes, loc.offset);
+  return { parsed, moovBytes, moovOffset: loc.offset, reader };
+}
+
+function contentOf(file: Loaded, box: { start?: number; size?: number; hdr_size?: number }): Uint8Array {
+  const start = (box.start ?? 0) + (box.hdr_size ?? 0);
+  const size = (box.size ?? 0) - (box.hdr_size ?? 0);
+  const rel = start - file.moovOffset;
+  return file.moovBytes.subarray(rel, rel + size);
+}
+
+interface ProbeStream {
+  codec_type?: string;
+  codec_name?: string;
+  width?: number;
+  height?: number;
+  channels?: number;
+  sample_rate?: string;
+}
+interface Probe {
+  streams: ProbeStream[];
+  format: { duration: string };
+}
+
+function ffprobe(file: string): Probe {
+  const r = spawnSync(ffprobePath, ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', file], {
+    encoding: 'utf8',
+  });
+  expect(r.status, r.stderr).toBe(0);
+  return JSON.parse(r.stdout) as Probe;
+}
+
+function expectCleanDecode(file: string): void {
+  const r = spawnSync(ffmpegPath, ['-v', 'error', '-i', file, '-f', 'null', '-'], { encoding: 'utf8' });
+  expect(r.status, r.stderr).toBe(0);
+}
+
+function topLevelBoxes(absPath: string): { type: string; start: number; size: number }[] {
+  const buf = readFileSync(absPath);
+  const out: { type: string; start: number; size: number }[] = [];
+  let pos = 0;
+  while (pos + 8 <= buf.length) {
+    const size = buf.readUInt32BE(pos);
+    const type = buf.toString('latin1', pos + 4, pos + 8);
+    if (size < 8) break;
+    out.push({ type, start: pos, size });
+    pos += size;
+  }
+  return out;
+}
+
+describe('moov location (front + back layouts)', () => {
+  it('finds moov at the front of a faststart file', async () => {
+    const size = statSync(FRONT).size;
+    const loc = await locateMoov(readerFor(FRONT), size);
+    expect(loc).not.toBeNull();
+    expect(loc!.offset).toBeLessThan(1024); // right behind ftyp
+    const head = await readerFor(FRONT)(loc!.offset, 8);
+    expect(String.fromCharCode(head[4], head[5], head[6], head[7])).toBe('moov');
+  });
+
+  it('finds moov at the end, after mdat', async () => {
+    const size = statSync(END).size;
+    const loc = await locateMoov(readerFor(END), size);
+    expect(loc).not.toBeNull();
+    expect(loc!.offset).toBeGreaterThan(size / 2);
+    const head = await readerFor(END)(loc!.offset, 8);
+    expect(String.fromCharCode(head[4], head[5], head[6], head[7])).toBe('moov');
+  });
+});
+
+describe('SourceMeta-grade metadata extraction (§8.1)', () => {
+  it('parses tracks, codecs, timescales, tables and frame rate', async () => {
+    const f = await load(FRONT);
+    const p = f.parsed;
+    expect(p.fragmented).toBe(false);
+    expect(p.durationSec).toBeCloseTo(1.0, 2);
+
+    const v = p.video;
+    expect(v).toBeDefined();
+    expect(v!.codec).toMatch(/^avc1\.64[0-9a-f]{4}$/i); // High profile
+    expect(v!.width).toBe(320);
+    expect(v!.height).toBe(240);
+    expect(v!.timescale).toBe(12800);
+    expect(v!.table).toBeDefined();
+    expect(v!.table!.count).toBe(25); // 1s @ 25fps
+    expect(frameRateOf(v!, p.durationSec)).toBe(25);
+    expect(v!.stsdEntry?.avcC ?? v!.stsdEntry?.boxes?.find((b) => b.type === 'avcC')).toBeDefined();
+
+    const a = p.audio;
+    expect(a).toBeDefined();
+    expect(a!.codec).toBe('mp4a.40.2');
+    expect(a!.timescale).toBe(44100);
+    expect(a!.sampleRate).toBe(44100);
+    expect(a!.channelCount).toBe(2);
+    expect(a!.table!.count).toBeGreaterThanOrEqual(40);
+    expect(a!.table!.count).toBeLessThanOrEqual(45);
+    const esds = a!.stsdEntry?.esds ?? a!.stsdEntry?.boxes?.find((b) => b.type === 'esds');
+    expect(esds).toBeDefined();
+    const asc = extractAscFromDescriptor(contentOf(f, esds!));
+    expect(asc).not.toBeNull();
+    expect(asc!.byteLength).toBeGreaterThanOrEqual(2);
+  });
+
+  it('parses a back-of-file moov to the same key values', async () => {
+    const f = await load(END);
+    const v = f.parsed.video;
+    expect(v).toBeDefined();
+    expect(v!.table!.count).toBe(25);
+    expect(v!.timescale).toBe(12800);
+    expect(f.parsed.durationSec).toBeCloseTo(1.0, 2);
+    expect(f.parsed.audio!.codec).toBe('mp4a.40.2');
+  });
+});
+
+describe('sample tables + cut-window math (§8.2)', () => {
+  it('maps sample offsets exactly onto mdat and cuts [5,15) correctly', async () => {
+    const f = await load(LONG);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+    expect(v.table!.count).toBe(400); // 16s @ 25fps
+
+    const mdat = topLevelBoxes(LONG).find((b) => b.type === 'mdat');
+    expect(mdat).toBeDefined();
+    const payloadStart = mdat!.start + 8;
+    const payloadEnd = mdat!.start + mdat!.size;
+    const all = [...v.table!.offsets.map((o, i) => o + v.table!.sizes[i]), ...a.table!.offsets.map((o, i) => o + a.table!.sizes[i])];
+    const minOff = Math.min(...v.table!.offsets, ...a.table!.offsets);
+    const maxEnd = Math.max(...all);
+    expect(minOff).toBeGreaterThanOrEqual(payloadStart);
+    expect(maxEnd).toBeLessThanOrEqual(payloadEnd);
+    expect(maxEnd).toBe(payloadEnd); // samples fill mdat exactly
+
+    // monotonic offsets, positive sizes
+    for (let i = 1; i < v.table!.count; i++) {
+      expect(v.table!.offsets[i]).toBeGreaterThanOrEqual(
+        v.table!.offsets[i - 1] + v.table!.sizes[i - 1],
+      );
+    }
+    expect(v.table!.sizes.every((s) => s > 0)).toBe(true);
+
+    // window math
+    const { from, to } = sampleRangeForWindow(v, 5, 15);
+    expect(v.table!.sync[from]).toBe(true);
+    expect(from).toBeLessThanOrEqual(sampleIndexAtTime(v.table!, v.timescale, 5));
+    expect(to).toBeGreaterThan(from);
+    expect(v.table!.pts[to - 1]).toBeLessThan(15 * v.timescale);
+    expect(sampleIndexAtTime(v.table!, v.timescale, 0)).toBe(0);
+    expect(sampleIndexAtTime(v.table!, v.timescale, v.table!.pts[100] / v.timescale)).toBe(100);
+    expect(sampleIndexAtTime(v.table!, v.timescale, 999)).toBe(v.table!.count - 1);
+    expect(lastSyncIndexBefore(v.table!, 100)).toBeLessThanOrEqual(100);
+    for (let i = 1; i < v.table!.count; i++) {
+      expect(v.table!.pts[i]).toBeGreaterThanOrEqual(v.table!.pts[i - 1]); // B-free
+    }
+  });
+});
+
+function videoSamplesFor(
+  file: Loaded,
+  track: ParsedTrack,
+  from: number,
+  to: number,
+  baseDts: number,
+): MuxSample[] {
+  const table = track.table!;
+  const out: MuxSample[] = [];
+  for (let i = from; i < to; i++) {
+    const dts = table.dts[i] - baseDts;
+    const nextDts = i + 1 < table.count ? table.dts[i + 1] : table.dts[i] + track.timescale / 25;
+    out.push({
+      data: readSync(file, table.offsets[i], table.sizes[i]),
+      dts,
+      cts: table.pts[i] - baseDts,
+      duration: Math.max(1, nextDts - table.dts[i]),
+      isSync: table.sync[i],
+    });
+  }
+  return out;
+}
+
+function readSync(file: Loaded, offset: number, length: number): Uint8Array {
+  // readerFor's backing buffer is fully loaded; perform a sync slice via the
+  // already-opened handle is impossible in sync context, so cache lazily:
+  const cached = readCache.get(file);
+  if (!cached) throw new Error('reader cache missing');
+  return cached.subarray(offset, offset + length);
+}
+
+const readCache = new WeakMap<Loaded, Buffer>();
+function cacheFile(path: string, file: Loaded): void {
+  readCache.set(file, readFileSync(path));
+}
+
+function audioOverlapSamples(
+  file: Loaded,
+  track: ParsedTrack,
+  startSec: number,
+  endSec: number,
+): MuxSample[] {
+  const table = track.table!;
+  const out: MuxSample[] = [];
+  let base = -1;
+  const pick: number[] = [];
+  for (let i = 0; i < table.count; i++) {
+    const dur = i + 1 < table.count ? table.dts[i + 1] - table.dts[i] : track.durationSamples - table.dts[i];
+    const sec = table.pts[i] / track.timescale;
+    const durSec = dur / track.timescale;
+    if (sec + durSec > startSec && sec < endSec) pick.push(i);
+  }
+  if (pick.length > 0) base = table.dts[pick[0]];
+  for (const i of pick) {
+    const dur = i + 1 < table.count ? table.dts[i + 1] - table.dts[i] : track.durationSamples - table.dts[i];
+    out.push({
+      data: readSync(file, table.offsets[i], table.sizes[i]),
+      dts: table.dts[i] - base,
+      cts: table.pts[i] - base,
+      duration: dur,
+      isSync: true,
+    });
+  }
+  return out;
+}
+
+describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
+  it('muxes a full clip → ffprobe-validated H.264 + AAC with clean decode', async () => {
+    const f = await load(FRONT);
+    cacheFile(FRONT, f);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+    const avcC = f.parsed.video!.stsdEntry?.avcC ?? f.parsed.video!.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+    const esds = a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!;
+    const asc = extractAscFromDescriptor(contentOf(f, esds));
+    expect(asc).not.toBeNull();
+
+    const audioSamples: MuxSample[] = [];
+    const table = a.table!;
+    for (let i = 0; i < table.count; i++) {
+      const dur = i + 1 < table.count ? table.dts[i + 1] - table.dts[i] : 1024;
+      audioSamples.push({
+        data: readSync(f, table.offsets[i], table.sizes[i]),
+        dts: table.dts[i],
+        cts: table.pts[i],
+        duration: dur,
+        isSync: true,
+      });
+    }
+
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: 320,
+        height: 240,
+        timescale: v.timescale,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples: videoSamplesFor(f, v, 0, v.table!.count, 0),
+      },
+      audio: {
+        codecType: 'mp4a',
+        sampleRate: a.sampleRate ?? 44100,
+        channelCount: a.channelCount ?? 2,
+        sampleSize: 16,
+        timescale: a.timescale,
+        esdsDescriptor: buildEsdDescriptor(asc!),
+        samples: audioSamples,
+      },
+    });
+    expect(mp4.byteLength).toBeGreaterThan(10_000);
+    writeFileSync(MUXED, mp4);
+
+    const probe = ffprobe(MUXED);
+    expect(probe.streams).toHaveLength(2);
+    const vs = probe.streams.find((s) => s.codec_type === 'video');
+    const as = probe.streams.find((s) => s.codec_type === 'audio');
+    expect(vs?.codec_name).toBe('h264');
+    expect(vs?.width).toBe(320);
+    expect(vs?.height).toBe(240);
+    expect(as?.codec_name).toBe('aac');
+    expect(as?.channels).toBe(2);
+    expect(Number(probe.format.duration)).toBeCloseTo(1.0, 1);
+    expectCleanDecode(MUXED);
+  }, 60_000);
+
+  it('muxes cut window [5,15) of a 16s source → ~10s clip, clean decode', async () => {
+    const f = await load(LONG);
+    cacheFile(LONG, f);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+
+    // video samples presenting inside [5,15) (decoder-window filter equivalent)
+    const startUs = 5 * v.timescale;
+    const endUs = 15 * v.timescale;
+    let first = sampleIndexAtTime(v.table!, v.timescale, 5);
+    while (first < v.table!.count && v.table!.pts[first] < startUs) first++;
+    let last = first;
+    while (last < v.table!.count && v.table!.pts[last] < endUs) last++;
+    expect(last - first).toBe(250); // 10s @ 25fps
+
+    const avcC = v.stsdEntry?.avcC ?? v.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+    const esds = a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!;
+    const asc = extractAscFromDescriptor(contentOf(f, esds));
+    expect(asc).not.toBeNull();
+
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: 320,
+        height: 240,
+        timescale: v.timescale,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples: videoSamplesFor(f, v, first, last, v.table!.dts[first]),
+      },
+      audio: {
+        codecType: 'mp4a',
+        sampleRate: a.sampleRate ?? 44100,
+        channelCount: a.channelCount ?? 2,
+        sampleSize: 16,
+        timescale: a.timescale,
+        esdsDescriptor: buildEsdDescriptor(asc!),
+        samples: audioOverlapSamples(f, a, 5, 15),
+      },
+    });
+    writeFileSync(CUT, mp4);
+
+    const probe = ffprobe(CUT);
+    expect(probe.streams).toHaveLength(2);
+    expect(probe.streams.find((s) => s.codec_type === 'video')?.codec_name).toBe('h264');
+    expect(probe.streams.find((s) => s.codec_type === 'audio')?.codec_name).toBe('aac');
+    const dur = Number(probe.format.duration);
+    expect(dur).toBeGreaterThan(9.8);
+    expect(dur).toBeLessThan(10.3);
+    expectCleanDecode(CUT);
+  }, 60_000);
+});
