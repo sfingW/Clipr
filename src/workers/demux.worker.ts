@@ -11,13 +11,14 @@ import {
   lastSyncIndexBefore,
   locateMoov,
   parseMoovBytes,
+  planRemuxAudio,
   sampleIndexAtTime,
   sampleRangeForWindow,
   type ByteRangeReader,
   type ParsedMp4,
   type ParsedTrack,
 } from '../core/mp4Parse';
-import { extractAscFromDescriptor } from '../core/mp4Mux';
+import { aacAccessUnitFrames, extractAscFromDescriptor } from '../core/mp4Mux';
 import {
   serveRpc,
   type DemuxWorker as DemuxMethods,
@@ -265,40 +266,33 @@ function ackGate(ctx: RpcServerContext): AckGate {
 
 async function buildRemuxAudio(
   audio: ParsedTrack,
+  framesPerAu: number,
+  sampleRate: number,
   startSec: number,
   endSec: number,
 ): Promise<StreamRemuxAudio | null> {
   const table = audio.table!;
-  const selected: number[] = [];
-  for (let i = 0; i < table.count; i++) {
-    const dur = i + 1 < table.count ? table.dts[i + 1] - table.dts[i] : audio.durationSamples - table.dts[i];
-    const sec = table.pts[i] / audio.timescale;
-    const durSec = dur / audio.timescale;
-    if (sec + durSec > startSec && sec < endSec) selected.push(i);
-  }
-  if (selected.length === 0) return null;
+  // Window AND timing come from PCM frame counts (planRemuxAudio) — the
+  // source stts box is ignored: a broken time-to-sample table used to shift
+  // the selection and inflate the muxed audio span (mp4box keeps whatever
+  // dts/duration we hand addSample, and mvhd takes the longest track).
+  const plan = planRemuxAudio(table.count, framesPerAu, sampleRate, startSec, endSec);
+  if (!plan) return null;
 
   let totalBytes = 0;
-  for (const i of selected) totalBytes += table.sizes[i];
+  for (const i of plan.indices) totalBytes += table.sizes[i];
   const buffer = new ArrayBuffer(totalBytes);
   const view = new Uint8Array(buffer);
-  const base = table.dts[selected[0]];
   const parts: StreamRemuxAudio['parts'] = [];
   let offset = 0;
-  for (const i of selected) {
+  for (let k = 0; k < plan.indices.length; k++) {
+    const i = plan.indices[k];
     const bytes = await session!.reader(table.offsets[i], table.sizes[i]);
     view.set(bytes, offset);
-    const dur = i + 1 < table.count ? table.dts[i + 1] - table.dts[i] : audio.durationSamples - table.dts[i];
-    parts.push({
-      start: offset,
-      length: bytes.byteLength,
-      dts: table.dts[i] - base,
-      cts: table.pts[i] - base,
-      duration: dur,
-    });
+    parts.push({ start: offset, length: bytes.byteLength, ...plan.parts[k] });
     offset += bytes.byteLength;
   }
-  return { buffer, parts, timescale: audio.timescale };
+  return { buffer, parts, timescale: plan.timescale };
 }
 
 async function streamPcmAudio(
@@ -355,6 +349,10 @@ async function streamPcmAudio(
         dec.decode(
           new EncodedAudioChunk({
             type: 'key',
+            // Source-stts derived (keeps window alignment with the selector);
+            // render.worker re-stamps every decoded AudioData from cumulative
+            // PCM frame counts before encoding, so mux timing never trusts
+            // this value — a broken stts must not change the output span.
             timestamp: toUs(table.pts[i], audio.timescale),
             data,
           }),
@@ -418,18 +416,26 @@ async function streamClipInner(
     audio?.stsdEntry?.esds ?? audio?.stsdEntry?.boxes?.find((b) => b.type === 'esds');
   const audioUsable = Boolean(audio && audio.table && audioEsds && payload.audio !== 'none');
   let meta: StreamMeta;
+  let remuxFramesPerAu = 0;
+  let remuxRate = 0;
   if (!audioUsable || !audio || !audioEsds) {
     meta = { totalVideoFrames: totalSend, fps: session!.fps, audio: { mode: 'none' } };
   } else if (payload.audio === 'remux') {
+    const esdsBytes = await boxContent(audioEsds);
+    remuxFramesPerAu = aacAccessUnitFrames(extractAscFromDescriptor(esdsBytes));
+    // Timing rate = codec sample rate (stsd/ASC), NOT the mdhd/stts machinery:
+    // parts from buildRemuxAudio are in these units and the mux track
+    // timescale is set to match (see planRemuxAudio).
+    remuxRate = audio.sampleRate || audio.timescale || 48000;
     meta = {
       totalVideoFrames: totalSend,
       fps: session!.fps,
       audio: {
         mode: 'remux',
-        esdsDescriptor: await boxContent(audioEsds),
-        sampleRate: audio.sampleRate ?? 48000,
+        esdsDescriptor: esdsBytes,
+        sampleRate: remuxRate,
         channels: audio.channelCount ?? 2,
-        timescale: audio.timescale,
+        timescale: remuxRate,
       },
     };
   } else {
@@ -446,7 +452,13 @@ async function streamClipInner(
   let batchId = 0;
   try {
     if (meta.audio.mode === 'remux') {
-      const remux = await buildRemuxAudio(audio!, payload.startSec, payload.endSec);
+      const remux = await buildRemuxAudio(
+        audio!,
+        remuxFramesPerAu,
+        remuxRate,
+        payload.startSec,
+        payload.endSec,
+      );
       if (remux) ctx.sendStream({ kind: 'audioRemux', audio: remux });
     } else if (meta.audio.mode === 'pcm') {
       await streamPcmAudio(audio!, payload.startSec, payload.endSec, ctx, gate);

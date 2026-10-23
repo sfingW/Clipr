@@ -72,6 +72,8 @@ interface RenderState {
   videoTrack: MuxVideoTrack | null;
   audioAscd: Uint8Array | null; // ASC from AudioEncoder metadata (pcm path)
   muxAudio: MuxAudioTrack | null;
+  /** Cumulative PCM frames decoded for this cut — the audio timeline clock. */
+  audioFramesIn: number;
   remuxParts: RemuxPart[] | null;
   remuxBuffer: ArrayBuffer | null;
   remuxTimescale: number;
@@ -298,8 +300,53 @@ async function processVideoBatch(st: RenderState, frames: VideoFrame[]): Promise
 
 async function processAudioBatch(st: RenderState, items: AudioData[]): Promise<void> {
   await ensureEncoders(st);
-  for (const item of items) st.audioQueue.push(item);
+  for (const item of items) st.audioQueue.push(restampAudioData(st, item));
   drainAudioQueue(st);
+}
+
+/**
+ * Re-stamp a decoded AudioData with a timeline built from ACTUAL PCM frames
+ * (cumulative numberOfFrames ÷ sampleRate), never from source metadata —
+ * AudioDecoder output timestamps inherit the source track's stts box, and a
+ * broken stts inflated the muxed audio span so far that mvhd (longest track)
+ * blew up the whole MP4 timeline (exact video PTS bug, audio edition). The
+ * AudioEncoder carries this timestamp onto every EncodedAudioChunk, so the
+ * µs → track-units conversion at finalize sees frame-count truth. Absolute
+ * stamping (cum × rate) means no rounding drift across batches.
+ */
+function restampAudioData(st: RenderState, item: AudioData): AudioData {
+  const rate = item.sampleRate || 48000;
+  const wantUs = Math.round((st.audioFramesIn * 1_000_000) / rate);
+  st.audioFramesIn += item.numberOfFrames;
+  const format = item.format;
+  if (item.timestamp === wantUs || !format) return item;
+  // AudioData is immutable (no `data` accessor since WebCodecs M94): copy the
+  // planes out and rebuild it with the corrected timestamp.
+  const planes = format.endsWith('-planar') ? item.numberOfChannels : 1;
+  const sizes: number[] = [];
+  let total = 0;
+  for (let p = 0; p < planes; p++) {
+    const n = item.allocationSize({ planeIndex: p });
+    sizes.push(n);
+    total += n;
+  }
+  const buf = new ArrayBuffer(total);
+  const view = new Uint8Array(buf);
+  let off = 0;
+  for (let p = 0; p < planes; p++) {
+    item.copyTo(view.subarray(off, off + sizes[p]), { planeIndex: p });
+    off += sizes[p];
+  }
+  const copy = new AudioData({
+    format,
+    sampleRate: item.sampleRate,
+    numberOfFrames: item.numberOfFrames,
+    numberOfChannels: item.numberOfChannels,
+    timestamp: wantUs,
+    data: buf,
+  });
+  item.close();
+  return copy;
 }
 
 function finalize(st: RenderState): { mp4: Uint8Array } {
@@ -341,8 +388,10 @@ function finalize(st: RenderState): { mp4: Uint8Array } {
   let audio: MuxAudioTrack | undefined;
 
   if (st.remuxParts && st.remuxBuffer && st.meta?.audio && st.meta.audio.mode === 'remux') {
-    // Passthrough AAC: source units (timescale = source audio timescale),
-    // contiguous from 0 (demux rebased dts), esds bytes from the source.
+    // Passthrough AAC: parts already carry sampleRate-unit timestamps derived
+    // from PCM frame counts by the demux (planRemuxAudio — stts-independent),
+    // contiguous from 0; timescale = sample rate so addSample durations map
+    // 1:1 and the audio span equals the real cut length. esds from the source.
     const buf = new Uint8Array(st.remuxBuffer);
     const ts = st.remuxTimescale;
     const samples: MuxSample[] = st.remuxParts.map((p) => ({
@@ -370,7 +419,8 @@ function finalize(st: RenderState): { mp4: Uint8Array } {
       };
     }
   } else if (st.muxAudio && st.muxAudio.samples.length > 0) {
-    // Transcoded AAC: µs → audio timescale units, monotonic from 0.
+    // Transcoded AAC: chunk timestamps are frame-count stamps from
+    // restampAudioData (µs) → audio timescale units, monotonic from 0.
     const track = st.muxAudio;
     if (!st.audioAscd) throw tagged('AUDIO_ENCODER_UNSUPPORTED', new Error('encoder produced no AAC descriptor'));
     track.esdsDescriptor = buildEsdDescriptor(st.audioAscd);
@@ -453,6 +503,7 @@ async function renderClipInner(
     videoTrack: null,
     audioAscd: null,
     muxAudio: null,
+    audioFramesIn: 0,
     remuxParts: null,
     remuxBuffer: null,
     remuxTimescale: 1000,
