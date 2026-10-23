@@ -247,6 +247,42 @@ describe('sample tables + cut-window math (§8.2)', () => {
       expect(v.table!.pts[i]).toBeGreaterThanOrEqual(v.table!.pts[i - 1]); // B-free
     }
   });
+
+  it('anchors cuts that start mid-GOP on the nearest sync sample (WebCodecs requires a key frame first)', async () => {
+    const f = await load(LONG);
+    const v = f.parsed.video!;
+    const table = v.table!;
+
+    // The reported bug: a cut starting at a non-sync sample must decode from
+    // the key frame at-or-before it — the first chunk after configure() (and
+    // after any flush) has to be typed 'key' or Chrome throws
+    // "A key frame is required after configure() or flush()".
+    const deltaSamples: number[] = [];
+    for (let i = 1; i < table.count; i++) if (!table.sync[i]) deltaSamples.push(i);
+    expect(deltaSamples.length).toBeGreaterThan(100); // fixture is mostly inter frames
+
+    const quarter = (q: number): number => deltaSamples[Math.floor(q * deltaSamples.length)];
+    for (const i of [quarter(0.1), quarter(0.35), quarter(0.6), quarter(0.9)]) {
+      // Start inside sample i (mid-frame epsilon keeps sampleIndexAtTime exact).
+      const start = (table.pts[i] + 256) / v.timescale;
+      const idx = sampleIndexAtTime(table, v.timescale, start);
+      expect(idx).toBe(i);
+      expect(table.sync[idx]).toBe(false); // the cut point itself is a delta frame
+
+      const end = start + 2;
+      const { from, to } = sampleRangeForWindow(v, start, end);
+      expect(table.sync[from]).toBe(true); // first decoded chunk = key frame
+      expect(from).toBeLessThanOrEqual(idx); // anchored at-or-before the cut …
+      expect(from).toBe(lastSyncIndexBefore(table, idx)); // … and it is the nearest
+      expect(to).toBeGreaterThan(idx); // window still covers the cut
+      expect(table.pts[to - 1]).toBeLessThan(end * v.timescale); // end bound exact
+      if (to < table.count) expect(table.pts[to]).toBeGreaterThanOrEqual(end * v.timescale);
+
+      // Samples between the anchor and the cut are decoded but discarded by
+      // the demux worker until frame.timestamp >= start (frame-accurate edge).
+      for (let k = from + 1; k < idx; k++) expect(table.sync[k]).toBe(false); // …strictly after it, all deltas
+    }
+  });
 });
 
 function videoSamplesFor(
