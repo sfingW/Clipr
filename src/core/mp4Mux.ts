@@ -209,8 +209,31 @@ function sumDurations(samples: MuxSample[]): number {
  * (fragmented layout — mp4box 0.5.x's first-party write path).
  */
 export function muxToMp4(input: MuxInput): Uint8Array {
-  const { video, audio } = input;
+  const { video } = input;
   if (video.samples.length === 0) throw new Error('mux: no video samples');
+
+  // Video is the MASTER CLOCK: the container duration is the video pts span,
+  // and audio is hard-capped to it before anything touches mp4box. Source
+  // audio metadata can be broken beyond diagnosis (observed: a 44.08s cut
+  // exported with a 2:18 / 3.13× player timeline), so never let it decide
+  // how long the file is: audio packets that start at or after the video end
+  // are dropped and the last survivor is truncated to stop exactly at the
+  // video end. mdhd/tkhd/mvhd then all agree with the video track.
+  const videoDur = sumDurations(video.samples); // video timescale units
+  const videoSpanSec = videoDur / video.timescale;
+  let audio: MuxAudioTrack | undefined;
+  if (input.audio && input.audio.samples.length > 0) {
+    const limit = Math.floor(videoSpanSec * input.audio.timescale); // audio units
+    const kept = input.audio.samples.filter((s) => Math.round(s.dts) < limit);
+    if (kept.length > 0) {
+      const samples = kept.map((s, i) =>
+        i === kept.length - 1
+          ? { ...s, duration: Math.max(1, Math.min(s.duration, limit - Math.round(s.dts))) }
+          : s,
+      );
+      audio = { ...input.audio, samples };
+    }
+  }
 
   const file = MP4Box.createFile();
   file.onError = (reason) => {
@@ -274,23 +297,21 @@ export function muxToMp4(input: MuxInput): Uint8Array {
   }
 
   // Durations (mp4box leaves them at 0 otherwise).
-  const videoDur = sumDurations(video.samples); // video timescale units
   const movieTimescale = file.moov?.mvhd?.timescale ?? video.timescale;
   const videoMovieDur = Math.round((videoDur * movieTimescale) / video.timescale);
   const vtrak = file.getTrackById(videoTrackId);
   vtrak?.mdia?.mdhd?.set?.('duration', videoDur);
   vtrak?.tkhd?.set?.('duration', videoMovieDur);
-  let movieDur = videoMovieDur;
   if (audio && audioTrackId !== 0) {
     const audioDur = sumDurations(audio.samples);
     const atrak = file.getTrackById(audioTrackId);
     atrak?.mdia?.mdhd?.set?.('duration', audioDur);
-    const audioMovieDur = Math.round((audioDur * movieTimescale) / audioTimescale);
-    atrak?.tkhd?.set?.('duration', audioMovieDur);
-    // Movie duration = LONGEST track (AAC tails/priming can outlast video).
-    movieDur = Math.max(movieDur, audioMovieDur);
+    atrak?.tkhd?.set?.('duration', Math.round((audioDur * movieTimescale) / audioTimescale));
+    // Audio was capped at the video span above, so its movie duration can
+    // never exceed videoMovieDur — but the container follows VIDEO either
+    // way: mvhd.duration = video track duration, exactly (master clock).
   }
-  file.moov?.mvhd?.set?.('duration', movieDur);
+  file.moov?.mvhd?.set?.('duration', videoMovieDur);
 
   const buffer = file.getBuffer();
   return new Uint8Array(buffer.slice(0));
