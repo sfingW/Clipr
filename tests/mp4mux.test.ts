@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import {
+  encodeFramerateFromPts,
   frameRateOf,
   lastSyncIndexBefore,
   locateMoov,
@@ -785,4 +786,68 @@ describe('audio timing from PCM frame counts (stts-independent, §8.10 regressio
     expect(total).toBeLessThan(10.15);
     expectCleanDecode(out);
   }, 60_000);
+});
+
+describe('duration timeline = stts pts span (poisoned-mdhd regression, §8.10)', () => {
+  it('ignores an mdhd that claims 2× the stts span for durationSec and frameRateOf', async () => {
+    // Observed on a real source: mdhd.duration overstated the sample table by
+    // exactly 2×. durationSec feeds the UI timeline AND frameRateOf, whose
+    // N/fps arithmetic is load-bearing in the FFmpeg fallback — a 2× mdhd
+    // used to mean a 2× export (166.2s cut → 332s; 18.75s → 37.5s).
+    const f = await load(LONG);
+    const v = f.parsed.video!;
+    const bytes = Buffer.from(f.moovBytes); // Buffer for BE reads + latin1 substrings
+
+    // Locate the video track's mdhd (match by its distinct timescale) and
+    // double its duration claim, leaving the stts box untouched.
+    let mdhdPos = -1;
+    const walk = (from: number, end: number): void => {
+      let pos = from;
+      while (pos + 8 <= end) {
+        const size = bytes.readUInt32BE(pos);
+        const t = bytes.toString('latin1', pos + 4, pos + 8);
+        if (size < 8) break;
+        if (t === 'mdhd' && bytes.readUInt32BE(pos + 20) === v.timescale) mdhdPos = pos;
+        if (['moov', 'trak', 'mdia'].includes(t)) walk(pos + 8, pos + size);
+        pos += size;
+      }
+    };
+    walk(0, bytes.length);
+    expect(mdhdPos).toBeGreaterThan(0);
+    const origDur = bytes.readUInt32BE(mdhdPos + 24);
+    expect(origDur / v.timescale).toBeCloseTo(16.0, 1);
+    bytes.writeUInt32BE(origDur * 2, mdhdPos + 24);
+
+    const p = parseMoovBytes(bytes, f.moovOffset);
+    expect(p.video).toBeTruthy();
+    // durationSec follows the sample table (16.0), not the poisoned mdhd (32.0)…
+    expect(p.durationSec).toBeCloseTo(16.0, 1);
+    expect(p.durationSec).toBeLessThan(20);
+    // …so frameRateOf stays at the real 25 fps. Half of that (12.5) was the
+    // multiplier that doubled N/fps-derived durations exactly.
+    expect(frameRateOf(p.video!, p.durationSec)).toBe(25);
+  });
+
+  it('encodes the FFmpeg fallback at a pts-derived framerate (count/rate = cut length)', () => {
+    // CFR sanity: 100 frames with a 40000µs step (25fps) → exactly 25.
+    expect(encodeFramerateFromPts(0, 99 * 40_000, 100, 999)).toBeCloseTo(25, 6);
+
+    // 30fps window of 18.75s: pts-derived rate ≈ 30, so image2 output
+    // duration = count/rate ≈ 18.767s (span + one frame) — the old
+    // N/frameRateOf(mdhd) arithmetic with a 2× mdhd would have used 15 and
+    // produced 37.5s, exactly the reported bug.
+    const count = 563;
+    const last = (count - 1) * (1_000_000 / 30);
+    const rate = encodeFramerateFromPts(0, last, count, 15);
+    expect(rate).toBeCloseTo(30, 1);
+    expect(count / rate).toBeCloseTo(18.7667, 3);
+
+    // Degenerate inputs fall back to the provided fps (or 25 when absurd).
+    expect(encodeFramerateFromPts(1000, 1000, 10, 30)).toBe(30); // zero span
+    expect(encodeFramerateFromPts(0, 1000, 1, 30)).toBe(30); // single frame
+    expect(encodeFramerateFromPts(Number.NaN, 1000, 10, 30)).toBe(30);
+    expect(encodeFramerateFromPts(0, 0, 5, Number.NaN)).toBe(25); // absurd fallback
+    // A valid pts span is trusted even when the fps fallback is absurd.
+    expect(encodeFramerateFromPts(0, 99 * 40_000, 100, Number.NaN)).toBeCloseTo(25, 6);
+  });
 });

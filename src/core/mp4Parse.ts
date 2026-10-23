@@ -26,6 +26,12 @@ export interface TrackSampleTable {
   pts: number[];
   /** Sync (key) samples. */
   sync: boolean[];
+  /**
+   * stts-derived media duration (Σ sample deltas) in track units — the
+   * trustworthy timeline length. mdhd.duration is a separate claim that can
+   * disagree (observed 2× off), so prefer this over mdhd everywhere.
+   */
+  durationUnits: number;
 }
 
 export interface ParsedTrack {
@@ -199,8 +205,9 @@ function buildSampleTable(stbl: Mp4Box): TrackSampleTable | null {
     for (let i = 0; i < count; i++) sizes[i] = perSample?.[i] ?? 0;
   }
 
-  // DTS from stts runs.
+  // DTS from stts runs (+ the stts total span, which becomes durationUnits).
   const dts: number[] = new Array(count);
+  let durationUnits = 0;
   {
     const runs: { count: number; delta: number }[] =
       stts.sample_counts && stts.sample_deltas
@@ -215,6 +222,7 @@ function buildSampleTable(stbl: Mp4Box): TrackSampleTable | null {
       }
     }
     for (; i < count; i++) dts[i] = cur;
+    durationUnits = cur; // Σ deltas applied over `count` samples
   }
 
   // PTS = DTS + composition offsets (absent ctts → identity).
@@ -288,7 +296,7 @@ function buildSampleTable(stbl: Mp4Box): TrackSampleTable | null {
     }
   }
 
-  return { count, offsets, sizes, dts, pts, sync };
+  return { count, offsets, sizes, dts, pts, sync, durationUnits };
 }
 
 /**
@@ -420,15 +428,18 @@ export function parseMoovBytes(moovBytes: Uint8Array, moovFileOffset: number): P
     };
     if (isVideo && !video) {
       video = track;
-      videoDurationSec = trackSec;
+      // Timeline length from the stts pts span, NOT mdhd: mdhd can disagree
+      // with the sample table (observed exactly 2× on a source file, which
+      // poisoned frameRateOf → N/fps arithmetic → a 2× export duration).
+      videoDurationSec = (table ? table.durationUnits / timescale : 0) || trackSec;
     } else if (!isVideo && !audio) {
       audio = track;
-      audioDurationSec = trackSec;
+      audioDurationSec = (table ? table.durationUnits / timescale : 0) || trackSec;
     }
   }
 
-  // Prefer the video timeline (mvhd can include AAC priming padding → 1.024s
-  // for a 1.0s clip), then audio, then mvhd, then any track.
+  // Prefer the video timeline (stts pts span; falls back to mdhd when the
+  // sample table is missing), then audio, then mvhd, then any track.
   const mvhdSec = mvhdDuration > 0 && mvhdTimescale > 0 ? mvhdDuration / mvhdTimescale : 0;
   const durationSec = videoDurationSec || audioDurationSec || mvhdSec || maxDurationSec;
   return { durationSec, fragmented, video, audio };
@@ -442,6 +453,29 @@ export function frameRateOf(track: ParsedTrack, durationSec: number): number {
   const common = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
   for (const c of common) if (Math.abs(raw - c) / c < 0.03) return c;
   return Math.round(raw * 100) / 100;
+}
+
+/**
+ * Frame rate for the FFmpeg fallback's image2 input such that
+ * `count / rate` equals the frames' ACTUAL pts span (+ one average frame) —
+ * i.e. the encoded file's duration matches the cut exactly, whatever
+ * frameRateOf()/mdhd claim. The old `N / frameRateOf(mdhd)` arithmetic came
+ * out exactly 2× when mdhd overstated the stts span by 2×.
+ */
+export function encodeFramerateFromPts(
+  firstPtsUs: number,
+  lastPtsUs: number,
+  count: number,
+  fallbackFps: number,
+): number {
+  const fallback = Number.isFinite(fallbackFps) && fallbackFps > 0 ? fallbackFps : 25;
+  if (count <= 1 || !Number.isFinite(firstPtsUs) || !Number.isFinite(lastPtsUs)) return fallback;
+  const spanSec = (lastPtsUs - firstPtsUs) / 1_000_000;
+  if (spanSec <= 0) return fallback;
+  const durSec = spanSec + spanSec / (count - 1); // pts span + one average frame
+  const rate = count / durSec;
+  if (!Number.isFinite(rate) || rate <= 0) return fallback;
+  return rate;
 }
 
 /** Index of the sample whose presentation window contains `tSec`
