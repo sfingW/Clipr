@@ -9,7 +9,7 @@
  */
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import coreURL from '@ffmpeg/core?url';
-import wasmURL from '@ffmpeg/core/wasm?url';
+import wholeWasmURL from '@ffmpeg/core/wasm?url';
 import { getDemuxClient } from '../app/workers';
 import { computeLayout } from '../core/renderLayout';
 import type { DemuxWorker, RpcClient, StreamMessage } from '../core/rpc';
@@ -17,6 +17,39 @@ import type { ClipSpec, SourceMeta } from '../core/types';
 
 interface ProgressSink {
   (p: { pct: number; note?: string; etaSec?: number }): void;
+}
+
+interface WasmManifest {
+  parts: string[];
+  totalSize: number;
+}
+
+/**
+ * Resolve the core wasm URL for `ffmpeg.load()` (SPEC §8.11).
+ *
+ * The production build splits any >25 MiB asset (Cloudflare Pages limit,
+ * see vite.config.ts) into same-origin parts + `<wasm>.parts.json`; here we
+ * fetch the parts and reassemble them into a `blob:` URL (same-origin, so
+ * COOP/COEP isolation is unaffected). When no manifest exists — `vite dev`,
+ * or an already-small asset — the whole-file URL is used directly.
+ */
+async function resolveWasmURL(): Promise<string> {
+  let manifest: WasmManifest | null = null;
+  try {
+    const res = await fetch(`${wholeWasmURL}.parts.json`);
+    if (res.ok) manifest = (await res.json()) as WasmManifest;
+  } catch {
+    manifest = null;
+  }
+  if (!manifest || manifest.parts.length === 0) return wholeWasmURL;
+  const dir = wholeWasmURL.slice(0, wholeWasmURL.lastIndexOf('/') + 1);
+  const buffers: ArrayBuffer[] = [];
+  for (const part of manifest.parts) {
+    const res = await fetch(dir + part);
+    if (!res.ok) throw new Error(`ffmpeg core part "${part}" failed: HTTP ${res.status}`);
+    buffers.push(await res.arrayBuffer());
+  }
+  return URL.createObjectURL(new Blob(buffers, { type: 'application/wasm' }));
 }
 
 /**
@@ -86,7 +119,12 @@ export async function renderClipViaFfmpeg(
 
   const ffmpeg = new FFmpeg();
   onProgress({ pct: 0, note: 'loading ffmpeg' });
-  await ffmpeg.load({ coreURL, wasmURL });
+  const assembledWasmURL = await resolveWasmURL();
+  try {
+    await ffmpeg.load({ coreURL, wasmURL: assembledWasmURL });
+  } finally {
+    if (assembledWasmURL.startsWith('blob:')) URL.revokeObjectURL(assembledWasmURL);
+  }
   ffmpeg.on('progress', ({ progress }: { progress: number }) => {
     onProgress({ pct: 82 + Math.max(0, Math.min(1, progress)) * 18, note: 'ffmpeg encode' });
   });

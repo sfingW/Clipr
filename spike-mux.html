@@ -21,6 +21,10 @@
         <label>
           end <input id="end" type="number" value="15" min="0.2" step="0.04" />
         </label>
+        <label title="Skip WebCodecs encode and run the §8.11 FFmpeg.wasm path (Safari fallback; also exercises the split-wasm reassembly)">
+          <input id="fallback" type="checkbox" />
+          force FFmpeg fallback
+        </label>
         <button id="run" class="btn btn--primary" disabled>Run cut</button>
       </div>
       <div class="spike__row">

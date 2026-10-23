@@ -6,6 +6,7 @@
  */
 import { ingestFile } from './pipeline/ingest';
 import { renderClipToBlob } from './pipeline/render';
+import { renderClipViaFfmpeg } from './pipeline/ffmpegFallback';
 import { locateMoov, parseMoovBytes, type ByteRangeReader } from './core/mp4Parse';
 import type { ClipSpec, SourceMeta } from './core/types';
 
@@ -22,6 +23,7 @@ const runBtn = $<HTMLButtonElement>('run');
 const logEl = $<HTMLPreElement>('log');
 const statusEl = $<HTMLSpanElement>('status');
 const downloadEl = $<HTMLAnchorElement>('download');
+const fallbackInput = $<HTMLInputElement>('fallback');
 
 let picked: File | null = null;
 let opened: Awaited<ReturnType<typeof ingestFile>> | null = null;
@@ -132,10 +134,13 @@ runBtn.addEventListener('click', () => {
         format: 'original',
         exportPreset: '1080p',
       };
-      log(`render: cut [${startSec}, ${endSec}) …`);
-      const blob = await renderClipToBlob(spec, source, (p) => {
+      log(`render: cut [${startSec}, ${endSec})${fallbackInput.checked ? ' via ffmpeg fallback' : ''} …`);
+      const onProgress = (p: { pct: number; note?: string }): void => {
         statusEl.textContent = `${p.pct.toFixed(0)}% ${p.note ?? ''}`;
-      });
+      };
+      const blob = fallbackInput.checked
+        ? await renderClipViaFfmpeg(spec, source, onProgress)
+        : await renderClipToBlob(spec, source, onProgress);
       log('render: done — verifying output…');
       await verifyOutput(blob);
       resultUrl = URL.createObjectURL(blob);
