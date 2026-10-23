@@ -97,11 +97,17 @@ function ensureVideoDecoder(): VideoDecoder {
   });
   try {
     const track = videoTrack();
+    const description = session!.avcC;
+    // AVC decoders need the avcC extradata; without `description` configure()
+    // can appear to succeed yet decoding fails (SPEC §8.2 — avcC from stsd).
+    if (!description || description.byteLength === 0) {
+      throw new Error('avcC extradata missing — VideoDecoderConfig.description is required for AVC');
+    }
     dec.configure({
       codec: track.codec,
       codedWidth: track.width,
       codedHeight: track.height,
-      description: session!.avcC,
+      description,
       optimizeForLatency: true,
     });
   } catch (err) {
@@ -457,19 +463,26 @@ async function streamClipInner(
     };
     let pending: VideoFrame[] = [];
     try {
-      for (let i = from; i < to; ) {
-        const chunkEnd = Math.min(to, i + 16);
-        for (; i < chunkEnd; i++) {
-          const data = await readSample(track, i);
-          dec.decode(
-            new EncodedVideoChunk({
-              type: table.sync[i] ? 'key' : 'delta',
-              timestamp: toUs(table.pts[i], timescale),
-              data,
-            }),
-          );
-        }
-        await dec.flush();
+      // WebCodecs requires a key chunk after configure() *and after every
+      // flush()* — a flush at an arbitrary (mid-GOP) boundary makes the next
+      // delta chunk throw "A key frame is required after configure() or
+      // flush()". So the ONLY flush is the final one below; between now and
+      // then we decode sample-by-sample, drain outputs as they arrive, and
+      // release them in acked batches (the ack gate is the backpressure, and
+      // memory stays bounded to one in-flight batch).
+      for (let i = from; i < to; i++) {
+        const data = await readSample(track, i);
+        dec.decode(
+          new EncodedVideoChunk({
+            // First chunk of the window is always typed 'key': `from` is
+            // sync-anchored by sampleRangeForWindow (nearest sync sample at or
+            // before sourceStartSec); force it regardless in case the stss
+            // flags ever disagree, since only the type is checked here.
+            type: i === from || table.sync[i] ? 'key' : 'delta',
+            timestamp: toUs(table.pts[i], timescale),
+            data,
+          }),
+        );
         for (const frame of out.splice(0, out.length)) {
           pending.push(frame);
           sent++;
@@ -481,12 +494,17 @@ async function streamClipInner(
           ctx.sendStream({ kind: 'videoBatch', frames, batchId: id, last: false });
           await gate.wait(id);
         }
-        ctx.progress(Math.min(95, 30 + (sent / totalSend) * 65), {
-          stage: 'rendering',
-          done: sent,
-          total: totalSend,
-        });
+        if (i % 8 === 0) {
+          ctx.progress(Math.min(95, 30 + (sent / totalSend) * 65), {
+            stage: 'rendering',
+            done: sent,
+            total: totalSend,
+          });
+        }
       }
+      // Single legal flush: drains every remaining output; nothing decodes
+      // after it (the next operation always starts a window with a key chunk).
+      await dec.flush();
       for (const frame of out.splice(0, out.length)) {
         pending.push(frame);
         sent++;
