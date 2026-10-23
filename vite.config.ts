@@ -15,6 +15,12 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: 'dist',
+    rollupOptions: {
+      input: {
+        main: new URL('./index.html', import.meta.url).pathname,
+        'spike-mux': new URL('./spike-mux.html', import.meta.url).pathname,
+      },
+    },
   },
   // Host allowlisting applies only to vite's dev/preview servers (the static
   // `dist` output is served by the CDN without vite); relaxed so preview

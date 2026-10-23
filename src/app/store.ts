@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { Candidate, ClipSpec, SourceMeta, Transcript } from '../core/types';
-import type { JobState } from '../core/jobMachine';
+import { canTransition, type JobState } from '../core/jobMachine';
 import type { Tier } from './tiers';
 
 /** Progress events as emitted by the pipeline (SPEC §8.4, §8.6, §8.10). */
@@ -38,6 +38,9 @@ export interface AppStore {
   setTier: (tier: Tier) => void;
   setJobState: (state: JobState) => void;
   setSource: (source: SourceMeta | null) => void;
+  /** Frame-accurate in/out for the active clip (SPEC §8.6). */
+  setCut: (startSec: number, endSec: number) => void;
+  setFormat: (format: ClipSpec['format']) => void;
   setTranscript: (transcript: Transcript | null) => void;
   setCandidates: (candidates: Candidate[]) => void;
   setClips: (clips: ClipSpec[]) => void;
@@ -67,8 +70,19 @@ export const useAppStore = create<AppStore>()((set) => ({
   exportPreset: '1080p',
 
   setTier: (tier) => set({ tier }),
-  setJobState: (jobState) => set({ jobState }),
+  setJobState: (jobState) =>
+    set((s) => (s.jobState === jobState || canTransition(s.jobState, jobState) ? { jobState } : s)),
   setSource: (source) => set({ source }),
+  setCut: (startSec, endSec) =>
+    set((s) => ({
+      clips: s.clips.map((c) =>
+        c.id === s.activeClipId ? { ...c, sourceStartSec: startSec, sourceEndSec: endSec } : c,
+      ),
+    })),
+  setFormat: (format) =>
+    set((s) => ({
+      clips: s.clips.map((c) => (c.id === s.activeClipId ? { ...c, format } : c)),
+    })),
   setTranscript: (transcript) => set({ transcript }),
   setCandidates: (candidates) => set({ candidates }),
   setClips: (clips) => set({ clips }),
