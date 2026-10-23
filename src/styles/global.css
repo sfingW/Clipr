@@ -1,0 +1,31 @@
+/* Clipr — Phase 0 base styles only. Design system arrives with real UI phases. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0e0e11;
+  color: #e7e7ea;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.dropzone {
+  flex: 1;
+  margin: 1.5rem;
+  border: 2px dashed #3a3a42;
+  border-radius: 12px;
+}
