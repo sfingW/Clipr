@@ -274,8 +274,8 @@ async function buildRemuxAudio(
   const table = audio.table!;
   // Window AND timing come from PCM frame counts (planRemuxAudio) — the
   // source stts box is ignored: a broken time-to-sample table used to shift
-  // the selection and inflate the muxed audio span (mp4box keeps whatever
-  // dts/duration we hand addSample, and mvhd takes the longest track).
+  // the selection and inflate the muxed audio span (muxToMp4 additionally
+  // hard-caps audio at the video pts span, but the source must be right too).
   const plan = planRemuxAudio(table.count, framesPerAu, sampleRate, startSec, endSec);
   if (!plan) return null;
 

@@ -520,9 +520,12 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     expect(dur).toBeCloseTo(expectedSec, 1); // 10.0s, NOT ~20s
   }, 60_000);
 
-  it('writes mvhd/tkhd/mdhd duration boxes equal to the sample sums (raw bytes)', async () => {
+  it('caps audio at the video span and writes every duration box (raw bytes)', async () => {
     // muxToMp4 must land its duration sets on every box (mp4box leaves them
-    // at 0 otherwise) and the movie duration must be the LONGEST track.
+    // at 0 otherwise). Video is the MASTER CLOCK: the fixture's AAC tail
+    // (16.0178s) overhangs the 16.0s video, so audio must be truncated to
+    // exactly the video span and mvhd.duration = video duration — audio
+    // metadata can never decide how long the file is.
     const f = await load(LONG);
     cacheFile(LONG, f);
     const v = f.parsed.video!;
@@ -532,7 +535,10 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     const videoSamples = videoSamplesFor(f, v, 0, v.table!.count, v.table!.dts[0]);
     const audioSamples = audioOverlapSamples(f, a, 0, 16.5);
     const expVideo = videoSamples.reduce((acc, x) => acc + x.duration, 0);
-    const expAudio = audioSamples.reduce((acc, x) => acc + x.duration, 0);
+    const expAudioRaw = audioSamples.reduce((acc, x) => acc + x.duration, 0);
+    const capLimit = Math.floor((expVideo / v.timescale) * a.timescale);
+    expect(expVideo / v.timescale).toBeCloseTo(16.0, 3);
+    expect(expAudioRaw).toBeGreaterThan(capLimit); // fixture overhangs on purpose
 
     const mp4 = muxToMp4({
       video: {
@@ -593,13 +599,75 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     expect(md0Ts).toBe(v.timescale);
     expect(md0Dur).toBe(expVideo); // media duration = Σ sample durations
     expect(md1Ts).toBe(a.timescale);
-    expect(md1Dur).toBe(expAudio);
+    expect(md1Dur).toBe(capLimit); // audio mdhd capped exactly at the video span
     const expTk0 = Math.round((expVideo * mvTs) / v.timescale);
-    const expTk1 = Math.round((expAudio * mvTs) / a.timescale);
+    const expTk1 = Math.round((capLimit * mvTs) / a.timescale);
     expect(tk0).toBe(expTk0);
     expect(tk1).toBe(expTk1);
-    expect(mvDur).toBe(Math.max(expTk0, expTk1)); // longest track, not just video
+    expect(expTk1).toBeLessThanOrEqual(expTk0); // audio never outlives video
+    expect(mvDur).toBe(expTk0); // mvhd = video track duration, exactly
     expect(mvDur / mvTs).toBeCloseTo(16.0, 1);
+  }, 60_000);
+
+  it('locks the player timeline to the video pts span even when audio claims 1.6× more', async () => {
+    // Reported bug (nuclear-option spec): a 44.08s cut exported with a 2:18
+    // / 3.13× player timeline — the audio track hijacked the container
+    // duration. Model it with the fixture's FULL 16.02s audio beside a 10s
+    // video window: whatever the audio samples claim, every duration source
+    // in the output must read 10.0s.
+    const f = await load(LONG);
+    cacheFile(LONG, f);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+    const { from, to } = sampleRangeForWindow(v, 5, 15);
+    expect(to - from).toBe(250);
+    const avcC = v.stsdEntry?.avcC ?? v.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+    const esds = a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!;
+
+    const videoSamples = videoSamplesFor(f, v, from, to, v.table!.dts[from]);
+    const expVideo = videoSamples.reduce((acc, x) => acc + x.duration, 0);
+    expect(expVideo / v.timescale).toBeCloseTo(10.0, 3);
+    const audioSamples = audioOverlapSamples(f, a, 0, 16.5); // full track ≈ 16.02s
+    const rawAudioSec =
+      audioSamples.reduce((acc, x) => acc + x.duration, 0) / a.timescale;
+    expect(rawAudioSec).toBeGreaterThan(1.5 * (expVideo / v.timescale)); // >1.6× the video
+
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: v.width ?? 320,
+        height: v.height ?? 240,
+        timescale: v.timescale,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples: videoSamples,
+      },
+      audio: {
+        codecType: 'mp4a',
+        sampleRate: a.sampleRate ?? 44100,
+        channelCount: a.channelCount ?? 2,
+        sampleSize: 16,
+        timescale: a.timescale,
+        esdsDescriptor: new Uint8Array(contentOf(f, esds)),
+        samples: audioSamples,
+      },
+    });
+    const out = `${DIR}/out_audio_cap.mp4`;
+    writeFileSync(out, mp4);
+
+    const probe = ffprobe(out);
+    expect(probe.streams).toHaveLength(2);
+    const vs = probe.streams.find((s) => s.codec_type === 'video')!;
+    const as = probe.streams.find((s) => s.codec_type === 'audio')!;
+    const total = Number(probe.format.duration);
+    const vDur = Number(vs.duration);
+    const aDur = Number(as.duration);
+    // Container, video track, and audio track ALL read the video pts span —
+    // no inflated timeline is possible, whatever the source metadata claims.
+    expect(total).toBeCloseTo(10.0, 2);
+    expect(vDur).toBeCloseTo(10.0, 2);
+    expect(aDur).toBeCloseTo(10.0, 2);
+    expect(Math.abs(aDur - vDur)).toBeLessThan(0.05);
+    expectCleanDecode(out);
   }, 60_000);
 });
 
@@ -706,7 +774,8 @@ describe('audio timing from PCM frame counts (stts-independent, §8.10 regressio
     const vs = probe.streams.find((s) => s.codec_type === 'video')!;
     const as = probe.streams.find((s) => s.codec_type === 'audio')!;
     // Audio span (Σ 1024 PCM frames @ sampleRate per packet) matches the
-    // video pts span — so mvhd/max() can no longer be blown out by stts.
+    // video pts span — and muxToMp4 caps audio at video regardless, so the
+    // container duration can no longer be blown out by broken stts.
     const vDur = Number(vs.duration);
     const aDur = Number(as.duration);
     expect(aDur).toBeGreaterThan(9.95);
