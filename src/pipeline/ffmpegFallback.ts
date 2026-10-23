@@ -12,6 +12,7 @@ import coreURL from '@ffmpeg/core?url';
 import wholeWasmURL from '@ffmpeg/core/wasm?url';
 import { getDemuxClient } from '../app/workers';
 import { computeLayout } from '../core/renderLayout';
+import { encodeFramerateFromPts } from '../core/mp4Parse';
 import type { DemuxWorker, RpcClient, StreamMessage } from '../core/rpc';
 import type { ClipSpec, SourceMeta } from '../core/types';
 
@@ -134,6 +135,8 @@ export async function renderClipViaFfmpeg(
   if (!ctx) throw new Error('fallback: 2d context unavailable');
 
   let frameIdx = 0;
+  let firstPtsUs = -1;
+  let lastPtsUs = 0;
   const pcmChunks: Float32Array[] = [];
   let audioChannels = 0;
   let audioRate = 0;
@@ -141,6 +144,11 @@ export async function renderClipViaFfmpeg(
   let fatal: Error | null = null;
 
   const captureFrame = async (frame: VideoFrame): Promise<void> => {
+    // Source pts of every captured frame (pre-close) — the timeline the
+    // output duration must match. frameRateOf()/mdhd were observed 2× off;
+    // this never trusts them (see encodeFramerateFromPts).
+    if (firstPtsUs < 0) firstPtsUs = frame.timestamp;
+    lastPtsUs = frame.timestamp;
     ctx.drawImage(frame, layout.sx, layout.sy, layout.sw, layout.sh, 0, 0, layout.outW, layout.outH);
     frame.close();
     const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
@@ -225,9 +233,12 @@ export async function renderClipViaFfmpeg(
     }
 
     onProgress({ pct: 82, note: 'ffmpeg encode' });
+    // image2 emits count frames at `rate` → duration = count/rate, so pick
+    // rate = count/duration(from actual pts) for an exact pts-span match.
+    const outFps = encodeFramerateFromPts(firstPtsUs, lastPtsUs, frameIdx, fps);
     const code = await ffmpeg.exec([
       '-framerate',
-      String(fps),
+      outFps.toFixed(6),
       '-i',
       'f%06d.jpg',
       ...(wroteWav ? ['-i', 'a.wav'] : []),
