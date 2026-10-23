@@ -268,9 +268,16 @@ async function processVideoBatch(st: RenderState, frames: VideoFrame[]): Promise
         outW,
         outH,
       );
+      // Presentation timestamp of the SOURCE frame (mp4 pts, µs, carried
+      // through the demux VideoDecoder). Deriving timestamps from the
+      // frameRateOf() fps guess made the muxed duration = N/fps — a source
+      // whose mdhd.duration disagrees with its stts (or an fps snap to a
+      // wrong "common" rate) scaled every export by that error (observed:
+      // exactly 2×). Real pts spacing keeps output duration = cut length.
+      const sourcePtsUs = frame.timestamp;
       frame.close();
       const vf = new VideoFrame(offscreen, {
-        timestamp: Math.round((st.framesReceived * 1_000_000) / Math.max(1, st.fps)),
+        timestamp: Math.round(sourcePtsUs),
         duration: durUs,
       });
       st.videoQueue.push(vf);

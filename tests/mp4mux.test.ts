@@ -460,4 +460,137 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     expect(dur).toBeLessThan(10.3);
     expectCleanDecode(CUT);
   }, 60_000);
+
+  it('derives duration from source pts — invariant to a wrong fps/timescale guess (§8.10 regression)', async () => {
+    // Regression for the "export is exactly 2× the cut" bug: render.worker
+    // stamps encoded frames with the decoded SOURCE pts (µs) and converts
+    // µs → track units via `us * TS / 1e6`. Even when frameRateOf() guesses
+    // a wrong fps (modelled here: TS = 12500 as if 12.5fps for a 25fps
+    // source), the muxed duration must equal the real pts span — index/fps
+    // arithmetic (i / fps) would come out 2× with the same TS.
+    const f = await load(LONG);
+    cacheFile(LONG, f);
+    const v = f.parsed.video!;
+    const table = v.table!;
+    const { from, to } = sampleRangeForWindow(v, 5, 15);
+    expect(from).toBe(125); // 5.0s keyframe anchor
+    expect(to).toBe(375); // 15.0s exclusive
+
+    const WRONG_TS = 12500; // fps guess = 12.5 while source really runs 25
+    const ptsUs = (i: number): number => Math.round((table.pts[i] * 1_000_000) / v.timescale);
+    const baseUs = ptsUs(from);
+    const stepUs = Math.round(1_000_000 / 25); // real frame cadence for the final sample
+    const samples: MuxSample[] = [];
+    for (let i = from; i < to; i++) {
+      const dtsUs = ptsUs(i);
+      const nextUs = i + 1 < to ? ptsUs(i + 1) : dtsUs + stepUs;
+      samples.push({
+        data: readSync(f, table.offsets[i], table.sizes[i]),
+        dts: Math.round(((dtsUs - baseUs) * WRONG_TS) / 1_000_000),
+        cts: Math.round(((dtsUs - baseUs) * WRONG_TS) / 1_000_000),
+        duration: Math.max(1, Math.round(((nextUs - dtsUs) * WRONG_TS) / 1_000_000)),
+        isSync: table.sync[i],
+      });
+    }
+    const expectedSec = (ptsUs(to - 1) + stepUs - baseUs) / 1_000_000;
+    expect(expectedSec).toBeCloseTo(10.0, 1);
+
+    const avcC = v.stsdEntry?.avcC ?? v.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: v.width ?? 320,
+        height: v.height ?? 240,
+        timescale: WRONG_TS,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples,
+      },
+    });
+    const out = `${DIR}/out_pts_invariance.mp4`;
+    writeFileSync(out, mp4);
+    const dur = Number(ffprobe(out).format.duration);
+    expect(dur).toBeCloseTo(expectedSec, 1); // 10.0s, NOT ~20s
+  }, 60_000);
+
+  it('writes mvhd/tkhd/mdhd duration boxes equal to the sample sums (raw bytes)', async () => {
+    // muxToMp4 must land its duration sets on every box (mp4box leaves them
+    // at 0 otherwise) and the movie duration must be the LONGEST track.
+    const f = await load(LONG);
+    cacheFile(LONG, f);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+    const avcC = v.stsdEntry?.avcC ?? v.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+
+    const videoSamples = videoSamplesFor(f, v, 0, v.table!.count, v.table!.dts[0]);
+    const audioSamples = audioOverlapSamples(f, a, 0, 16.5);
+    const expVideo = videoSamples.reduce((acc, x) => acc + x.duration, 0);
+    const expAudio = audioSamples.reduce((acc, x) => acc + x.duration, 0);
+
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: v.width ?? 320,
+        height: v.height ?? 240,
+        timescale: v.timescale,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples: videoSamples,
+      },
+      audio: {
+        codecType: 'mp4a',
+        sampleRate: a.sampleRate ?? 44100,
+        channelCount: a.channelCount ?? 2,
+        sampleSize: 16,
+        timescale: a.timescale,
+        esdsDescriptor: new Uint8Array(
+          contentOf(f, a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!),
+        ),
+        samples: audioSamples,
+      },
+    });
+    const out = `${DIR}/out_duration_boxes.mp4`;
+    writeFileSync(out, mp4);
+    const buf = readFileSync(out);
+
+    // Nested box walker for the three duration-bearing boxes (v0 layouts).
+    const find = (type: string): number[] => {
+      const acc: number[] = [];
+      const walk = (from: number, end: number): void => {
+        let pos = from;
+        while (pos + 8 <= end) {
+          const size = buf.readUInt32BE(pos);
+          const t = buf.toString('latin1', pos + 4, pos + 8);
+          if (size < 8) break;
+          if (t === type) acc.push(pos);
+          if (['moov', 'trak', 'mdia'].includes(t)) walk(pos + 8, pos + size);
+          pos += size;
+        }
+      };
+      walk(0, buf.length);
+      return acc;
+    };
+
+    const mv = find('mvhd')[0];
+    const mvTs = buf.readUInt32BE(mv + 20);
+    const mvDur = buf.readUInt32BE(mv + 24);
+    const tks = find('tkhd');
+    const mds = find('mdhd');
+    const tk0 = buf.readUInt32BE(tks[0] + 28);
+    const tk1 = buf.readUInt32BE(tks[1] + 28);
+    const md0Ts = buf.readUInt32BE(mds[0] + 20);
+    const md0Dur = buf.readUInt32BE(mds[0] + 24);
+    const md1Ts = buf.readUInt32BE(mds[1] + 20);
+    const md1Dur = buf.readUInt32BE(mds[1] + 24);
+
+    expect(mvTs).toBe(v.timescale); // mvhd adopts the first track's timescale
+    expect(md0Ts).toBe(v.timescale);
+    expect(md0Dur).toBe(expVideo); // media duration = Σ sample durations
+    expect(md1Ts).toBe(a.timescale);
+    expect(md1Dur).toBe(expAudio);
+    const expTk0 = Math.round((expVideo * mvTs) / v.timescale);
+    const expTk1 = Math.round((expAudio * mvTs) / a.timescale);
+    expect(tk0).toBe(expTk0);
+    expect(tk1).toBe(expTk1);
+    expect(mvDur).toBe(Math.max(expTk0, expTk1)); // longest track, not just video
+    expect(mvDur / mvTs).toBeCloseTo(16.0, 1);
+  }, 60_000);
 });

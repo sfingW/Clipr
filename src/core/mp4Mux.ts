@@ -204,6 +204,10 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     audioTimescale = audio.timescale;
   }
 
+  // NOTE: sample duration/dts/cts below are already in the TRACK's
+  // timescale units (render.worker converts µs → units via
+  // `us * timescale / 1_000_000`) — mp4box takes them as-is. Passing raw
+  // microseconds here would scale the duration by timescale/1e6.
   for (const s of video.samples) {
     file.addSample(videoTrackId, s.data, {
       duration: Math.max(1, Math.round(s.duration)),
@@ -226,18 +230,21 @@ export function muxToMp4(input: MuxInput): Uint8Array {
   // Durations (mp4box leaves them at 0 otherwise).
   const videoDur = sumDurations(video.samples); // video timescale units
   const movieTimescale = file.moov?.mvhd?.timescale ?? video.timescale;
-  const movieDur = Math.round((videoDur * movieTimescale) / video.timescale);
-  file.moov?.mvhd?.set?.('duration', movieDur);
+  const videoMovieDur = Math.round((videoDur * movieTimescale) / video.timescale);
   const vtrak = file.getTrackById(videoTrackId);
   vtrak?.mdia?.mdhd?.set?.('duration', videoDur);
-  vtrak?.tkhd?.set?.('duration', movieDur);
+  vtrak?.tkhd?.set?.('duration', videoMovieDur);
+  let movieDur = videoMovieDur;
   if (audio && audioTrackId !== 0) {
     const audioDur = sumDurations(audio.samples);
     const atrak = file.getTrackById(audioTrackId);
     atrak?.mdia?.mdhd?.set?.('duration', audioDur);
     const audioMovieDur = Math.round((audioDur * movieTimescale) / audioTimescale);
     atrak?.tkhd?.set?.('duration', audioMovieDur);
+    // Movie duration = LONGEST track (AAC tails/priming can outlast video).
+    movieDur = Math.max(movieDur, audioMovieDur);
   }
+  file.moov?.mvhd?.set?.('duration', movieDur);
 
   const buffer = file.getBuffer();
   return new Uint8Array(buffer.slice(0));
