@@ -489,3 +489,42 @@ export function sampleTimeSec(track: ParsedTrack, index: number): number {
   if (!table) throw new Error('track has no sample table (fragmented)');
   return table.pts[index] / track.timescale;
 }
+
+export interface RemuxAudioPlan {
+  /** Selected packet indices, ascending. */
+  indices: number[];
+  /** Timestamp/duration unit = PCM frames per second — pass as the mux track timescale. */
+  timescale: number;
+  /** Per-packet timing (timescale units), rebased so the first part starts at 0. */
+  parts: { dts: number; cts: number; duration: number }[];
+}
+
+/**
+ * Window selection + passthrough timing for an AAC track derived purely from
+ * PCM frame counts (§8.10): packet `i` occupies media seconds
+ * [i·framesPerAu/sampleRate, (i+1)·framesPerAu/sampleRate), because every
+ * AAC access unit carries a fixed number of PCM frames. The source stts box
+ * is never consulted — a broken time-to-sample table must not shift the cut
+ * window or inflate the muxed audio span. For a healthy AAC-LC file this is
+ * numerically identical to its stts (uniform 1024-unit deltas from 0).
+ */
+export function planRemuxAudio(
+  packetCount: number,
+  framesPerAu: number,
+  sampleRate: number,
+  startSec: number,
+  endSec: number,
+): RemuxAudioPlan | null {
+  const rate = sampleRate > 0 ? sampleRate : 48000;
+  const fl = framesPerAu > 0 ? framesPerAu : 1024;
+  const durSec = fl / rate;
+  const indices: number[] = [];
+  for (let i = 0; i < packetCount; i++) {
+    const sec = i * durSec;
+    if (sec + durSec > startSec && sec < endSec) indices.push(i);
+  }
+  if (indices.length === 0) return null;
+  const base = indices[0];
+  const parts = indices.map((i) => ({ dts: (i - base) * fl, cts: (i - base) * fl, duration: fl }));
+  return { indices, timescale: rate, parts };
+}

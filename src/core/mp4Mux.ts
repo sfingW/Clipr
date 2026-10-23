@@ -151,6 +151,52 @@ export function extractAscFromDescriptor(descriptor: Uint8Array): Uint8Array | n
   return null;
 }
 
+/**
+ * PCM frames a single AAC access unit decodes to — the real per-packet
+ * duration. MPEG-4 audio frames are constant-length: GASpecificConfig
+ * frameLengthFlag selects 1024 (flag 0) or 960 (flag 1); explicit SBR/PS
+ * (AOT 5/29) doubles the decoder output (×2). Anything unparseable falls
+ * back to 1024 (AAC-LC default). Timing derived from this never consults the
+ * source stts box, so a broken time-to-sample table cannot inflate the
+ * muxed audio span (mp4box `addSample` durations are in the track
+ * timescale, which we set to the sample rate).
+ */
+export function aacAccessUnitFrames(asc: Uint8Array | null | undefined): number {
+  if (!asc || asc.byteLength < 2) return 1024;
+  let bit = 0;
+  const bits = (n: number): number => {
+    let v = 0;
+    for (let i = 0; i < n; i++) {
+      const byte = asc[bit >> 3] ?? 0;
+      v = (v << 1) | ((byte >> (7 - (bit & 7))) & 1);
+      bit++;
+    }
+    return v;
+  };
+  const getAot = (): number => {
+    let aot = bits(5);
+    if (aot === 31) aot = 32 + bits(6);
+    return aot;
+  };
+  let aot = getAot();
+  let sfi = bits(4);
+  if (sfi === 0xf) bits(24); // explicit sampling frequency
+  bits(4); // channelConfiguration
+  let sbr = false;
+  if (aot === 5 || aot === 29) {
+    // The frequency read above is the extension rate; core AOT + rate follow.
+    sbr = true;
+    aot = getAot();
+    sfi = bits(4);
+    if (sfi === 0xf) bits(24);
+  }
+  let longFrame = false;
+  if ([1, 2, 3, 4, 7, 17, 19, 21, 22, 23].includes(aot)) {
+    longFrame = bits(1) === 1; // GASpecificConfig.frameLengthFlag → 960
+  }
+  return (longFrame ? 960 : 1024) * (sbr ? 2 : 1);
+}
+
 function sumDurations(samples: MuxSample[]): number {
   let total = 0;
   for (const s of samples) total += s.duration;

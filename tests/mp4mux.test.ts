@@ -11,13 +11,20 @@ import {
   lastSyncIndexBefore,
   locateMoov,
   parseMoovBytes,
+  planRemuxAudio,
   sampleIndexAtTime,
   sampleRangeForWindow,
   type ByteRangeReader,
   type ParsedMp4,
   type ParsedTrack,
 } from '../src/core/mp4Parse';
-import { buildEsdDescriptor, extractAscFromDescriptor, muxToMp4, type MuxSample } from '../src/core/mp4Mux';
+import {
+  aacAccessUnitFrames,
+  buildEsdDescriptor,
+  extractAscFromDescriptor,
+  muxToMp4,
+  type MuxSample,
+} from '../src/core/mp4Mux';
 
 const nodeRequire = createRequire(import.meta.url);
 const ffmpegPath: string = nodeRequire('@ffmpeg-installer/ffmpeg').path;
@@ -110,6 +117,7 @@ interface ProbeStream {
   height?: number;
   channels?: number;
   sample_rate?: string;
+  duration?: string;
 }
 interface Probe {
   streams: ProbeStream[];
@@ -592,5 +600,120 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     expect(tk1).toBe(expTk1);
     expect(mvDur).toBe(Math.max(expTk0, expTk1)); // longest track, not just video
     expect(mvDur / mvTs).toBeCloseTo(16.0, 1);
+  }, 60_000);
+});
+
+describe('audio timing from PCM frame counts (stts-independent, §8.10 regression)', () => {
+  it('derives frames-per-access-unit from the ASC: 1024 / 960 / SBR ×2, safe defaults', async () => {
+    // Real AAC-LC ASC from the fixture esds → 1024.
+    const f = await load(LONG);
+    const a = f.parsed.audio!;
+    const esds = a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!;
+    const asc = extractAscFromDescriptor(contentOf(f, esds));
+    expect(asc).not.toBeNull();
+    expect(aacAccessUnitFrames(asc)).toBe(1024);
+
+    // Hand-assembled AudioSpecificConfig bitstreams:
+    // AAC-LC 44.1kHz stereo, frameLengthFlag = 1 → 960; flag 0 → 1024.
+    expect(aacAccessUnitFrames(new Uint8Array([0x12, 0x14]))).toBe(960);
+    expect(aacAccessUnitFrames(new Uint8Array([0x12, 0x10]))).toBe(1024);
+    // Explicit SBR (AOT 5, extension 44.1k / core 22.05k): ×2 output frames.
+    expect(aacAccessUnitFrames(new Uint8Array([0x2a, 0x10, 0x9c, 0x00]))).toBe(2048);
+    // Unparseable input falls back to the AAC-LC default — never to stts.
+    expect(aacAccessUnitFrames(null)).toBe(1024);
+    expect(aacAccessUnitFrames(new Uint8Array([0xff]))).toBe(1024);
+  });
+
+  it('plans the cut window and part timing from packet index alone (a broken stts cannot inflate it)', () => {
+    const RATE = 44100;
+    const FL = 1024;
+    const COUNT = Math.ceil((16 * RATE) / FL); // packets a 16s AAC-LC track holds
+    const plan = planRemuxAudio(COUNT, FL, RATE, 5, 15);
+    expect(plan).not.toBeNull();
+
+    // Packet i occupies [i·FL/RATE, (i+1)·FL/RATE): first packet overlapping
+    // 5s starts at 4.992s (ends 5.016s), last packet starting below 15s at
+    // 14.977s — 431 packets ≈ 10.008s of audio for the 10s video window.
+    expect(plan!.indices[0]).toBe(215);
+    expect(plan!.indices[plan!.indices.length - 1]).toBe(645);
+    expect(plan!.indices.length).toBe(431);
+    expect(plan!.timescale).toBe(RATE);
+
+    // Contiguous, fixed-size parts rebased to the window start — the mux
+    // receives span = n·FL/RATE (10.008s) regardless of what any source
+    // stts box claims, and durations are already in the track timescale.
+    expect(plan!.parts[0]).toEqual({ dts: 0, cts: 0, duration: FL });
+    expect(plan!.parts[plan!.parts.length - 1].dts).toBe(430 * FL);
+    const span = (plan!.indices.length * FL) / RATE;
+    expect(span).toBeGreaterThan(10.0);
+    expect(span).toBeLessThan(10.02);
+
+    // Window beyond the track → no packets (render then drops the audio track).
+    expect(planRemuxAudio(COUNT, FL, RATE, 20, 30)).toBeNull();
+  });
+
+  it('muxes planned audio beside the video window → track spans match, mvhd sane', async () => {
+    const f = await load(LONG);
+    cacheFile(LONG, f);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+    const { from, to } = sampleRangeForWindow(v, 5, 15);
+    expect(to - from).toBe(250); // 10s @ 25fps
+
+    const avcC = v.stsdEntry?.avcC ?? v.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+    const esds = a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!;
+    const asc = extractAscFromDescriptor(contentOf(f, esds));
+    expect(asc).not.toBeNull();
+    const rate = a.sampleRate ?? 44100;
+
+    const plan = planRemuxAudio(a.table!.count, aacAccessUnitFrames(asc), rate, 5, 15)!;
+    expect(plan).not.toBeNull();
+    // Healthy fixture: stts selection and frame-count selection agree packet
+    // for packet (uniform 1024-unit deltas) — the new path only differs when
+    // the source metadata is broken.
+    expect(plan.indices.length).toBe(audioOverlapSamples(f, a, 5, 15).length);
+
+    const audioSamples: MuxSample[] = plan.indices.map((idx, k) => ({
+      data: readSync(f, a.table!.offsets[idx], a.table!.sizes[idx]),
+      ...plan.parts[k],
+      isSync: true,
+    }));
+
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: v.width ?? 320,
+        height: v.height ?? 240,
+        timescale: v.timescale,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples: videoSamplesFor(f, v, from, to, v.table!.dts[from]),
+      },
+      audio: {
+        codecType: 'mp4a',
+        sampleRate: rate,
+        channelCount: a.channelCount ?? 2,
+        sampleSize: 16,
+        timescale: plan.timescale, // sample rate — part units map 1:1
+        esdsDescriptor: buildEsdDescriptor(asc!),
+        samples: audioSamples,
+      },
+    });
+    const out = `${DIR}/out_audio_plan.mp4`;
+    writeFileSync(out, mp4);
+
+    const probe = ffprobe(out);
+    expect(probe.streams).toHaveLength(2);
+    const vs = probe.streams.find((s) => s.codec_type === 'video')!;
+    const as = probe.streams.find((s) => s.codec_type === 'audio')!;
+    // Audio span (Σ 1024 PCM frames @ sampleRate per packet) matches the
+    // video pts span — so mvhd/max() can no longer be blown out by stts.
+    const vDur = Number(vs.duration);
+    const aDur = Number(as.duration);
+    expect(aDur).toBeGreaterThan(9.95);
+    expect(Math.abs(aDur - vDur)).toBeLessThan(0.1);
+    const total = Number(probe.format.duration);
+    expect(total).toBeGreaterThan(9.95);
+    expect(total).toBeLessThan(10.15);
+    expectCleanDecode(out);
   }, 60_000);
 });
