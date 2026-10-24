@@ -9,7 +9,7 @@
  */
 import { getDemuxClient, getRenderClient } from '../app/workers';
 import type { RpcClient, StreamMessage } from '../core/rpc';
-import type { ClipSpec, SourceMeta } from '../core/types';
+import type { ClipSpec, SourceMeta, Word } from '../core/types';
 
 export interface RenderProgress {
   pct: number; // 0..100 across the whole render
@@ -35,6 +35,7 @@ function audioModeFor(source: SourceMeta): 'remux' | 'pcm' | 'none' {
 export async function renderClipToBlob(
   spec: ClipSpec,
   source: SourceMeta,
+  words: Word[],
   onProgress: (p: RenderProgress) => void,
 ): Promise<Blob> {
   const demux: RpcClient<import('../core/rpc').DemuxWorker> = getDemuxClient();
@@ -88,7 +89,7 @@ export async function renderClipToBlob(
   );
   const renderReq = render.request(
     'render.clip',
-    { spec, source },
+    { spec, source, words },
     {
       requestId: renderId,
       onProgress: (p) => {

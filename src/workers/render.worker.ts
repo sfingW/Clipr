@@ -31,7 +31,8 @@ import {
   type RpcServerContext,
   type StreamMeta,
 } from '../core/rpc';
-import type { SourceMeta } from '../core/types';
+import type { ClipSpec, SourceMeta, Word } from '../core/types';
+import { drawClipCaptions } from '../pipeline/caption';
 
 const AAC_SAMPLE_RATE_FALLBACK = 48000;
 
@@ -58,6 +59,9 @@ interface RenderState {
   source: SourceMeta;
   meta: StreamMeta | null;
   layout: { sx: number; sy: number; sw: number; sh: number; outW: number; outH: number };
+  /** Absolute source-time transcript words; filtered per frame by drawClipCaptions. */
+  words: Word[];
+  spec: ClipSpec;
   fps: number;
   framesReceived: number;
   samplesWritten: number;
@@ -273,6 +277,18 @@ async function processVideoBatch(st: RenderState, frames: VideoFrame[]): Promise
         outW,
         outH,
       );
+      // Captions (SPEC §8.9): same function the preview overlay uses. The
+      // frame's pts is absolute source time; drawClipCaptions shifts it to
+      // clip-relative time. Skipped entirely for `none` / no transcript.
+      if (st.words.length > 0) {
+        drawClipCaptions(
+          ctx2d,
+          st.words,
+          { startSec: st.spec.sourceStartSec, endSec: st.spec.sourceEndSec },
+          frame.timestamp / 1e6,
+          st.spec.captionStyleId,
+        );
+      }
       // Presentation timestamp of the SOURCE frame (mp4 pts, µs, carried
       // through the demux VideoDecoder). Deriving timestamps from the
       // frameRateOf() fps guess made the muxed duration = N/fps — a source
@@ -476,7 +492,7 @@ async function renderClipInner(
   payload: RenderMethods['render.clip']['payload'],
   ctx: RpcServerContext,
 ): Promise<{ mp4: Uint8Array }> {
-  const { spec, source } = payload;
+  const { spec, source, words } = payload;
   const layout = computeLayout(spec, source);
 
   let resolveDone!: (v: { mp4: Uint8Array }) => void;
@@ -492,6 +508,8 @@ async function renderClipInner(
     source,
     meta: null,
     layout,
+    words: words ?? [],
+    spec,
     fps: Math.min(60, Math.max(1, source.frameRate || 25)),
     framesReceived: 0,
     samplesWritten: 0,

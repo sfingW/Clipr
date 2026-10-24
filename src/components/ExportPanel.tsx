@@ -88,8 +88,8 @@ export default function ExportPanel({
       </div>
 
       <p className="export__note">
-        Captions and speaker tracking arrive in a later phase (see SPEC §21) — this is the
-        frame-accurate cutter.
+        Captions come from the transcript and are drawn the same way in the preview and the
+        export. Speaker tracking arrives in a later phase (see SPEC §21).
       </p>
 
       <div className="export__actions">

@@ -65,3 +65,21 @@ describe('store: resetJob', () => {
     expect(useAppStore.getState().jobState).toBe('idle');
   });
 });
+
+describe('setCaptionStyle (Phase 3)', () => {
+  it('updates the store default and the active clip spec together', () => {
+    useAppStore.setState({
+      activeClipId: 'c1',
+      captionStyleId: 'bold-center',
+      clips: [
+        { id: 'c1', sourceStartSec: 0, sourceEndSec: 2, crop: [], captionStyleId: 'bold-center', captions: [], format: 'vertical', exportPreset: '1080p' },
+        { id: 'c2', sourceStartSec: 0, sourceEndSec: 2, crop: [], captionStyleId: 'bold-center', captions: [], format: 'vertical', exportPreset: '1080p' },
+      ],
+    });
+    useAppStore.getState().setCaptionStyle('karaoke');
+    const s = useAppStore.getState();
+    expect(s.captionStyleId).toBe('karaoke');
+    expect(s.clips.find((c) => c.id === 'c1')?.captionStyleId).toBe('karaoke');
+    expect(s.clips.find((c) => c.id === 'c2')?.captionStyleId).toBe('bold-center');
+  });
+});
