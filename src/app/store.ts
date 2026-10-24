@@ -31,6 +31,28 @@ export interface AsrStatus {
 export const INITIAL_ASR: AsrStatus = { phase: 'idle', pct: 0, note: null, error: null };
 
 /**
+ * WebGPU capability, probed once at startup (SPEC §11). `unknown` until the
+ * probe finishes. `unavailable` hides every AI control and shows a notice.
+ */
+export type WebGpuStatus = 'unknown' | 'available' | 'unavailable';
+
+/** AI scoring status, kept apart from the job state (SPEC §8.6, §10). */
+export type LlmPhase = 'idle' | 'loading' | 'scoring' | 'ready' | 'failed';
+
+export interface LlmStatus {
+  phase: LlmPhase;
+  /** 0–100 within the current phase (model download, or scoring). */
+  pct: number;
+  note: string | null;
+  /** Non-blocking, user-facing reason when `phase === 'failed'`. */
+  error: string | null;
+  done?: number;
+  total?: number;
+}
+
+export const INITIAL_LLM: LlmStatus = { phase: 'idle', pct: 0, note: null, error: null };
+
+/**
  * Store shape: job state + UI state (SPEC §6).
  * Job state follows the §10 state machine; one job per ingested file.
  */
@@ -46,6 +68,8 @@ export interface AppStore {
   progress: JobProgress | null;
   error: string | null;
   asr: AsrStatus;
+  llm: LlmStatus;
+  webgpu: WebGpuStatus;
 
   // ui state
   /** Shared playhead in source seconds: scrub position, and what the transcript highlights. */
@@ -74,6 +98,8 @@ export interface AppStore {
   setProgress: (progress: JobProgress | null) => void;
   setError: (error: string | null) => void;
   setAsr: (patch: Partial<AsrStatus>) => void;
+  setLlm: (patch: Partial<LlmStatus>) => void;
+  setWebGpu: (status: WebGpuStatus) => void;
 
   // ui actions
   setPlayhead: (sec: number) => void;
@@ -93,6 +119,8 @@ export const useAppStore = create<AppStore>()((set) => ({
   progress: null,
   error: null,
   asr: INITIAL_ASR,
+  llm: INITIAL_LLM,
+  webgpu: 'unknown',
 
   playheadSec: 0,
   selectedCandidateId: null,
@@ -105,7 +133,15 @@ export const useAppStore = create<AppStore>()((set) => ({
   // A new source invalidates everything derived from the previous one.
   resetJob: () => set({ jobState: 'idle' }),
   setSource: (source) =>
-    set({ source, transcript: null, asr: INITIAL_ASR, playheadSec: 0, candidates: [], selectedCandidateId: null }),
+    set({
+      source,
+      transcript: null,
+      asr: INITIAL_ASR,
+      llm: INITIAL_LLM,
+      playheadSec: 0,
+      candidates: [],
+      selectedCandidateId: null,
+    }),
   setCut: (startSec, endSec) =>
     set((s) => ({
       clips: s.clips.map((c) =>
@@ -123,6 +159,8 @@ export const useAppStore = create<AppStore>()((set) => ({
   setProgress: (progress) => set({ progress }),
   setError: (error) => set({ error }),
   setAsr: (patch) => set((s) => ({ asr: { ...s.asr, ...patch } })),
+  setLlm: (patch) => set((s) => ({ llm: { ...s.llm, ...patch } })),
+  setWebGpu: (webgpu) => set({ webgpu }),
 
   setPlayhead: (playheadSec) => set({ playheadSec: Math.max(0, playheadSec) }),
   selectCandidate: (selectedCandidateId) => set({ selectedCandidateId }),

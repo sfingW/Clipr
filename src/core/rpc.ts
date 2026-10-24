@@ -16,7 +16,7 @@ export type Progress = {
   id: string;
   pct: number;
   note?: string;
-  stage?: 'ingest' | 'asr' | 'asr_loading' | 'asr_running' | 'scoring' | 'vision' | 'rendering';
+  stage?: 'ingest' | 'asr' | 'asr_loading' | 'asr_running' | 'llm_loading' | 'scoring' | 'vision' | 'rendering';
   etaSec?: number;
   done?: number;
   total?: number;
