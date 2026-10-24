@@ -81,7 +81,7 @@ export interface VisionWorker {
 
 export interface RenderWorker {
   'render.clip': {
-    payload: { spec: ClipSpec; source: import('./types').SourceMeta };
+    payload: { spec: ClipSpec; source: import('./types').SourceMeta; words: import('./types').Word[] };
     result: { mp4: Uint8Array };
   };
 }

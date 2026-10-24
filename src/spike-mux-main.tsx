@@ -139,8 +139,8 @@ runBtn.addEventListener('click', () => {
         statusEl.textContent = `${p.pct.toFixed(0)}% ${p.note ?? ''}`;
       };
       const blob = fallbackInput.checked
-        ? await renderClipViaFfmpeg(spec, source, onProgress)
-        : await renderClipToBlob(spec, source, onProgress);
+        ? await renderClipViaFfmpeg(spec, source, [], onProgress)
+        : await renderClipToBlob(spec, source, [], onProgress);
       log('render: done — verifying output…');
       await verifyOutput(blob);
       resultUrl = URL.createObjectURL(blob);

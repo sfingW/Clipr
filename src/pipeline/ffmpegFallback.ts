@@ -13,7 +13,8 @@ import wholeWasmURL from '@ffmpeg/core/wasm?url';
 import { getDemuxClient } from '../app/workers';
 import { computeLayout } from '../core/renderLayout';
 import type { DemuxWorker, RpcClient, StreamMessage } from '../core/rpc';
-import type { ClipSpec, SourceMeta } from '../core/types';
+import type { ClipSpec, SourceMeta, Word } from '../core/types';
+import { drawClipCaptions } from './caption';
 
 interface ProgressSink {
   (p: { pct: number; note?: string; etaSec?: number }): void;
@@ -109,6 +110,7 @@ function wavFromFloat32(samples: Float32Array, sampleRate: number, channels: num
 export async function renderClipViaFfmpeg(
   spec: ClipSpec,
   source: SourceMeta,
+  words: Word[],
   onProgress: ProgressSink,
 ): Promise<Blob> {
   const layout = computeLayout(spec, source);
@@ -145,6 +147,16 @@ export async function renderClipViaFfmpeg(
 
   const captureFrame = async (frame: VideoFrame): Promise<void> => {
     ctx.drawImage(frame, layout.sx, layout.sy, layout.sw, layout.sh, 0, 0, layout.outW, layout.outH);
+    // Same caption call as render.worker (SPEC §8.9); frame pts is absolute.
+    if (words.length > 0) {
+      drawClipCaptions(
+        ctx,
+        words,
+        { startSec: spec.sourceStartSec, endSec: spec.sourceEndSec },
+        frame.timestamp / 1e6,
+        spec.captionStyleId,
+      );
+    }
     frame.close();
     const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
     const bytes = new Uint8Array(await blob.arrayBuffer());

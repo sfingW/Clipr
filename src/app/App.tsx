@@ -117,12 +117,14 @@ export default function App() {
       const onProgress = (p: RenderProgress): void => {
         setProgress({ stage: 'rendering', pct: p.pct, note: p.note, etaSec: p.etaSec });
       };
+      // Transcript words (absolute source time) feed the caption overlay.
+      const words = useAppStore.getState().transcript?.words ?? [];
       try {
-        return await renderClipToBlob(spec, src, onProgress);
+        return await renderClipToBlob(spec, src, words, onProgress);
       } catch (err) {
         if (isCodecUnsupported(err)) {
           onProgress({ pct: 0, stage: 'rendering', note: 'webcodecs unsupported — ffmpeg fallback' });
-          return renderClipViaFfmpeg(spec, src, (p) => onProgress({ ...p, stage: 'rendering' }));
+          return renderClipViaFfmpeg(spec, src, words, (p) => onProgress({ ...p, stage: 'rendering' }));
         }
         throw err;
       }

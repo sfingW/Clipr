@@ -144,6 +144,36 @@ body {
   min-height: 220px;
 }
 
+/* Wrapper the caption overlay is positioned in: same box as the canvas. */
+.preview__frame {
+  position: relative;
+  max-width: 100%;
+  line-height: 0;
+}
+
+/* Overlay sits over the crop rect (left/top/width/height set inline). */
+.preview__captions {
+  position: absolute;
+  pointer-events: none;
+  display: block;
+}
+
+.preview__captions-style {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #b8b8c6;
+}
+
+.preview__captions-style select {
+  background: #1d1d26;
+  color: inherit;
+  border: 1px solid #33333d;
+  border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+}
+
 .preview__canvas {
   max-width: 100%;
   max-height: 56vh;

@@ -126,6 +126,12 @@ export const useAppStore = create<AppStore>()((set) => ({
 
   setPlayhead: (playheadSec) => set({ playheadSec: Math.max(0, playheadSec) }),
   selectCandidate: (selectedCandidateId) => set({ selectedCandidateId }),
-  setCaptionStyle: (captionStyleId) => set({ captionStyleId }),
+  // Keeps the store default and the active clip's spec in step: the render
+  // reads captionStyleId from the spec, the preview reads it from the clip.
+  setCaptionStyle: (captionStyleId) =>
+    set((s) => ({
+      captionStyleId,
+      clips: s.clips.map((c) => (c.id === s.activeClipId ? { ...c, captionStyleId } : c)),
+    })),
   setExportPreset: (exportPreset) => set({ exportPreset }),
 }));
