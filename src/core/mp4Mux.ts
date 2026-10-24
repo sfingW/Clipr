@@ -288,11 +288,18 @@ export function muxToMp4(input: MuxInput): Uint8Array {
   // timescale units (render.worker converts µs → units via
   // `us * timescale / 1_000_000`) — mp4box takes them as-is. Passing raw
   // microseconds here would scale the duration by timescale/1e6.
+  // mp4box 0.5.x bug: a fragment's tfdt is `sample.dts - trak.first_dts`, but
+  // addSample only records first_dts while it is FALSY. When the first sample
+  // sits at dts 0, the second sample overwrites first_dts and every fragment
+  // after the first is stamped one frame early (tfdt 0,0,512,… for 512-unit
+  // frames). A constant 1-unit bias on dts AND cts keeps first_dts truthy and
+  // cancels out of tfdt (tfdt = (dts+1) - (first+1)); cts - dts is unchanged.
+  const MP4BOX_FIRST_DTS_BIAS = 1;
   for (const s of video.samples) {
     file.addSample(videoTrackId, s.data, {
       duration: Math.max(1, Math.round(s.duration)),
-      dts: Math.round(s.dts),
-      cts: Math.round(s.cts),
+      dts: Math.round(s.dts) + MP4BOX_FIRST_DTS_BIAS,
+      cts: Math.round(s.cts) + MP4BOX_FIRST_DTS_BIAS,
       is_sync: s.isSync,
     });
   }
@@ -300,8 +307,8 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     for (const s of audio.samples) {
       file.addSample(audioTrackId, s.data, {
         duration: Math.max(1, Math.round(s.duration)),
-        dts: Math.round(s.dts),
-        cts: Math.round(s.cts),
+        dts: Math.round(s.dts) + MP4BOX_FIRST_DTS_BIAS,
+        cts: Math.round(s.cts) + MP4BOX_FIRST_DTS_BIAS,
         is_sync: true,
       });
     }

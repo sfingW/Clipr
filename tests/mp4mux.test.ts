@@ -721,6 +721,60 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     expect(at.mdhdDur / at.mdhdTs).toBeCloseTo(expAudioSec, 1);
     expect(at.tkhdDur).toBe(10_000);
 
+    // Fragment timeline (moof/traf/tfdt/trun): mp4box generates these from the
+    // samples we add, so they must start at 0, run contiguously, and sum to
+    // exactly the cut length per track — no 16s or 2× values can survive.
+    const fragTotals = new Map<number, { first: number; expectedNext: number; dur: number; samples: number }>();
+    for (const moofPos of boxes(0, buf.length, 'moof')) {
+      const moofEnd = moofPos + buf.readUInt32BE(moofPos);
+      for (const trafPos of boxes(moofPos + 8, moofEnd, 'traf')) {
+        const trafEnd = trafPos + buf.readUInt32BE(trafPos);
+        const tfhd = boxes(trafPos + 8, trafEnd, 'tfhd')[0];
+        const tfdt = boxes(trafPos + 8, trafEnd, 'tfdt')[0];
+        const trunPos = boxes(trafPos + 8, trafEnd, 'trun')[0];
+        const trackId = buf.readUInt32BE(tfhd + 12);
+        expect(buf.readUInt8(tfdt + 8)).toBe(0); // tfdt v0 (32-bit)
+        const decodeTime = buf.readUInt32BE(tfdt + 12);
+
+        const flags = buf.readUInt32BE(trunPos + 8) & 0xffffff;
+        const count = buf.readUInt32BE(trunPos + 12);
+        let o = trunPos + 16;
+        if (flags & 0x1) o += 4; // data_offset
+        if (flags & 0x4) o += 4; // first_sample_flags
+        let runDur = 0;
+        for (let i = 0; i < count; i++) {
+          let d = 0;
+          if (flags & 0x100) {
+            d = buf.readUInt32BE(o);
+            o += 4;
+          }
+          if (flags & 0x200) o += 4;
+          if (flags & 0x400) o += 4;
+          if (flags & 0x800) o += 4;
+          runDur += d;
+        }
+
+        const st = fragTotals.get(trackId) ?? { first: -1, expectedNext: -1, dur: 0, samples: 0 };
+        if (st.first < 0) {
+          st.first = decodeTime;
+          expect(decodeTime).toBe(0); // timeline starts at zero
+        } else {
+          expect(decodeTime).toBe(st.expectedNext); // contiguous, no gaps/overlap
+        }
+        st.expectedNext = decodeTime + runDur;
+        st.dur += runDur;
+        st.samples += count;
+        fragTotals.set(trackId, st);
+      }
+    }
+    const vFrag = fragTotals.get(1)!;
+    const aFrag = fragTotals.get(2)!;
+    expect(vFrag.samples).toBe(250);
+    expect(vFrag.dur).toBe(expVideoUnits); // 10.0s @ 12800
+    expect(aFrag.dur).toBe(10 * rate); // 10.0s @ 44100 (capped)
+    expect(vFrag.expectedNext / v.timescale).toBeCloseTo(10.0, 6);
+    expect(aFrag.expectedNext / rate).toBeCloseTo(10.0, 6);
+
     // Never the poisoned 2× (16s) span anywhere in the header.
     for (const d of [vt.tkhdDur / movieTs, at.tkhdDur / movieTs, vt.mdhdDur / vt.mdhdTs, at.mdhdDur / at.mdhdTs]) {
       expect(d).toBeLessThan(11);
