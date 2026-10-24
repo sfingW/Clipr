@@ -1,9 +1,16 @@
 /**
- * MP4 muxing wrapper around mp4box.js (SPEC §8.10: "Mux with mp4box.js").
- * Pure: mp4box serializes every box; we only drive its packaging API
- * (`addTrack` / `addSample` / `getBuffer`). Never hand-roll MP4 boxes.
+ * MP4 muxing on top of mp4-muxer (WebCodecs-native, progressive output).
+ *
+ * Why not mp4box: mp4box.js 0.5.x writes fragmented MP4 (`moof` per sample +
+ * `mvex`), which QuickTime/QuickLook times from the fragments rather than the
+ * movie header. mp4-muxer writes a single `moov` + `mdat` file with the moov
+ * placed first (`fastStart: 'in-memory'`), so no `moof`/`mvex` boxes exist and
+ * every duration in the header is derived from the chunk timestamps we pass.
+ *
+ * Callers still hand us samples in TRACK timescale units; we convert them to
+ * the microseconds mp4-muxer expects.
  */
-import MP4Box, { type Mp4Box } from 'mp4box';
+import { ArrayBufferTarget, Muxer } from 'mp4-muxer';
 
 export interface MuxSample {
   data: Uint8Array;
@@ -32,9 +39,10 @@ export interface MuxAudioTrack {
   channelCount: number;
   sampleSize: number;
   timescale: number;
-  /** esds box parsed from the source container (AAC remux path). */
-  sourceEsdsBox?: Mp4Box;
-  /** MPEG-4 ES descriptor payload for a freshly built esds (transcode path). */
+  /**
+   * MPEG-4 ES descriptor payload (AAC), required by `muxToMp4` when audio is
+   * present. The AudioSpecificConfig is read from it; mp4-muxer writes esds.
+   */
   esdsDescriptor?: Uint8Array;
   samples: MuxSample[];
 }
@@ -43,12 +51,6 @@ export interface MuxInput {
   brands?: string[];
   video: MuxVideoTrack;
   audio?: MuxAudioTrack;
-}
-
-function toOwnedBuffer(data: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(data.byteLength);
-  copy.set(data);
-  return copy.buffer;
 }
 
 /**
@@ -88,20 +90,6 @@ export function buildEsdDescriptor(asc: Uint8Array): Uint8Array {
   return es;
 }
 
-function makeEsdsBox(descriptor: Uint8Array): Mp4Box {
-  const box = new MP4Box.BoxParser.esdsBox();
-  box.set('version', 0);
-  box.set('flags', 0);
-  box.data = descriptor;
-  return box;
-}
-
-/**
- * Pull the AAC AudioSpecificConfig (DecoderSpecificInfo, tag 0x05) out of an
- * ES_Descriptor payload — needed to configure WebCodecs audio codecs/decoders.
- * Handles both single-byte and 4-byte expandable descriptor lengths (ffmpeg
- * emits `80 80 80 xx`).
- */
 function readVint(buf: Uint8Array, i: number): { len: number; next: number } | null {
   let len = 0;
   let bytes = 0;
@@ -158,7 +146,7 @@ export function extractAscFromDescriptor(descriptor: Uint8Array): Uint8Array | n
  * (AOT 5/29) doubles the decoder output (×2). Anything unparseable falls
  * back to 1024 (AAC-LC default). Timing derived from this never consults the
  * source stts box, so a broken time-to-sample table cannot inflate the
- * muxed audio span (mp4box `addSample` durations are in the track
+ * muxed audio span (the sample durations are in the track
  * timescale, which we set to the sample rate).
  */
 export function aacAccessUnitFrames(asc: Uint8Array | null | undefined): number {
@@ -203,22 +191,33 @@ function sumDurations(samples: MuxSample[]): number {
   return total;
 }
 
+const MICROSECONDS = 1_000_000;
+
+/** Track timescale units → integer microseconds (mp4-muxer's input unit). */
+function toUs(units: number, timescale: number): number {
+  return Math.round((units * MICROSECONDS) / timescale);
+}
+
+/** RFC 6381 `avc1.PPCCLL` string from the avcC record (profile, constraints, level). */
+export function avcCodecString(avcC: Uint8Array): string {
+  if (avcC.byteLength < 4) throw new Error('mux: avcC record too short');
+  const hex = (b: number): string => b.toString(16).padStart(2, '0');
+  return `avc1.${hex(avcC[1])}${hex(avcC[2])}${hex(avcC[3])}`;
+}
+
 /**
- * Mux encoded video (+ optional audio) samples into a single MP4.
- * Uses mp4box's packaging flow: ftyp + moov, then one moof+mdat per sample
- * (fragmented layout — mp4box 0.5.x's first-party write path).
+ * Mux encoded video (+ optional audio) samples into one progressive MP4
+ * (`ftyp` + `moov` + `mdat`, moov first). Returns the file bytes.
+ *
+ * Video is the MASTER CLOCK: the container duration is the video pts span,
+ * and audio is hard-capped to it. Audio packets that start at or after the
+ * video end are dropped, and the last survivor is trimmed to stop exactly at
+ * the video end, so audio metadata can never decide how long the file is.
  */
 export function muxToMp4(input: MuxInput): Uint8Array {
   const { video } = input;
   if (video.samples.length === 0) throw new Error('mux: no video samples');
 
-  // Video is the MASTER CLOCK: the container duration is the video pts span,
-  // and audio is hard-capped to it before anything touches mp4box. Source
-  // audio metadata can be broken beyond diagnosis (observed: a 44.08s cut
-  // exported with a 2:18 / 3.13× player timeline), so never let it decide
-  // how long the file is: audio packets that start at or after the video end
-  // are dropped and the last survivor is truncated to stop exactly at the
-  // video end. mdhd/tkhd/mvhd then all agree with the video track.
   const videoDur = sumDurations(video.samples); // video timescale units
   const videoSpanSec = videoDur / video.timescale;
   let audio: MuxAudioTrack | undefined;
@@ -228,14 +227,13 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     const kept = input.audio.samples.filter((s) => Math.round(s.dts) < limit);
     let trimmedUnits = 0;
     if (kept.length > 0) {
+      // Trim the final audio packet so the audio timeline ends at the video end.
       const last = kept[kept.length - 1];
       const cappedDur = Math.max(1, Math.min(last.duration, limit - Math.round(last.dts)));
       trimmedUnits = last.duration - cappedDur;
       const samples = kept.map((s, i) => (i === kept.length - 1 ? { ...s, duration: cappedDur } : s));
       audio = { ...input.audio, samples };
     }
-    // Diagnostic (requested): prove whether the video-master cap actually
-    // drops / truncates audio past the video span.
     console.warn('AUDIO_CAP:', {
       before,
       after: kept.length,
@@ -246,131 +244,52 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     });
   }
 
-  const file = MP4Box.createFile();
-  file.onError = (reason) => {
-    throw new Error(`mp4box mux error: ${reason}`);
-  };
-
-  const videoTrackId = file.addTrack({
-    type: 'avc1',
-    width: video.width,
-    height: video.height,
-    timescale: video.timescale,
-    hdlr: 'vide',
-    name: 'Clipr Video',
-    brands: input.brands ?? ['isom', 'iso6', 'avc1', 'mp41'],
-    avcDecoderConfigRecord: toOwnedBuffer(video.avcDecoderConfigRecord),
+  const avcC = video.avcDecoderConfigRecord;
+  const target = new ArrayBufferTarget();
+  const muxer = new Muxer({
+    target,
+    video: { codec: 'avc', width: video.width, height: video.height },
+    ...(audio ? { audio: { codec: 'aac' as const, numberOfChannels: audio.channelCount, sampleRate: audio.sampleRate } } : {}),
+    // Progressive, moov first. No moof/mvex boxes are written.
+    fastStart: 'in-memory',
+    // Both tracks start at 0 in practice; cross-track offset preserves A/V sync if not.
+    firstTimestampBehavior: 'cross-track-offset',
   });
 
-  let audioTrackId = 0;
-  let audioTimescale = 1;
-  if (audio && audio.samples.length > 0) {
-    const description = audio.sourceEsdsBox
-      ? audio.sourceEsdsBox
-      : audio.esdsDescriptor
-        ? makeEsdsBox(audio.esdsDescriptor)
+  video.samples.forEach((s, i) => {
+    const meta =
+      i === 0
+        ? { decoderConfig: { codec: avcCodecString(avcC), description: new Uint8Array(avcC) } }
         : undefined;
-    if (!description) throw new Error('mux: audio track needs sourceEsdsBox or esdsDescriptor');
-    audioTrackId = file.addTrack({
-      type: 'mp4a',
-      timescale: audio.timescale,
-      channel_count: audio.channelCount,
-      samplesize: audio.sampleSize,
-      samplerate: audio.sampleRate << 16,
-      hdlr: 'soun',
-      name: 'Clipr Audio',
-      description,
-    });
-    audioTimescale = audio.timescale;
-  }
-
-  // NOTE: sample duration/dts/cts below are already in the TRACK's
-  // timescale units (render.worker converts µs → units via
-  // `us * timescale / 1_000_000`) — mp4box takes them as-is. Passing raw
-  // microseconds here would scale the duration by timescale/1e6.
-  // mp4box 0.5.x bug: a fragment's tfdt is `sample.dts - trak.first_dts`, but
-  // addSample only records first_dts while it is FALSY. When the first sample
-  // sits at dts 0, the second sample overwrites first_dts and every fragment
-  // after the first is stamped one frame early (tfdt 0,0,512,… for 512-unit
-  // frames). A constant 1-unit bias on dts AND cts keeps first_dts truthy and
-  // cancels out of tfdt (tfdt = (dts+1) - (first+1)); cts - dts is unchanged.
-  const MP4BOX_FIRST_DTS_BIAS = 1;
-  for (const s of video.samples) {
-    file.addSample(videoTrackId, s.data, {
-      duration: Math.max(1, Math.round(s.duration)),
-      dts: Math.round(s.dts) + MP4BOX_FIRST_DTS_BIAS,
-      cts: Math.round(s.cts) + MP4BOX_FIRST_DTS_BIAS,
-      is_sync: s.isSync,
-    });
-  }
-  if (audio && audioTrackId !== 0) {
-    for (const s of audio.samples) {
-      file.addSample(audioTrackId, s.data, {
-        duration: Math.max(1, Math.round(s.duration)),
-        dts: Math.round(s.dts) + MP4BOX_FIRST_DTS_BIAS,
-        cts: Math.round(s.cts) + MP4BOX_FIRST_DTS_BIAS,
-        is_sync: true,
-      });
-    }
-  }
-
-  // Durations (mp4box leaves them at 0 otherwise). The MOVIE header is
-  // forced to standard milliseconds (1000), never whatever timescale the
-  // source or mp4box's init() carried over (a poisoned ~15000 made a
-  // 30.73s cut play as 61s: 921000/15000). mvhd.duration = video duration
-  // in ms = Math.round(videoDurationSec * 1000); tkhd durations live in
-  // mvhd units too, so they convert through the same 1000.
-  const movieTimescale = 1000;
-  const videoMovieDur = Math.round((videoDur * movieTimescale) / video.timescale);
-  const vtrak = file.getTrackById(videoTrackId);
-  vtrak?.mdia?.mdhd?.set?.('duration', videoDur);
-  vtrak?.tkhd?.set?.('duration', videoMovieDur);
-  if (audio && audioTrackId !== 0) {
-    const audioDur = sumDurations(audio.samples);
-    const atrak = file.getTrackById(audioTrackId);
-    atrak?.mdia?.mdhd?.set?.('duration', audioDur);
-    atrak?.tkhd?.set?.('duration', Math.round((audioDur * movieTimescale) / audioTimescale));
-    // Audio was capped at the video span above, so its movie duration can
-    // never exceed videoMovieDur — but the container follows VIDEO either
-    // way: mvhd.duration = video track duration, exactly (master clock).
-  }
-  file.moov?.mvhd?.set?.('timescale', movieTimescale);
-  file.moov?.mvhd?.set?.('duration', videoMovieDur);
-
-  // Diagnostic (requested): the exact durations written into the file,
-  // logged right before getBuffer() freezes them.
-  const lastVideoSample = video.samples[video.samples.length - 1];
-  const lastAudioSample = audio && audio.samples.length > 0 ? audio.samples[audio.samples.length - 1] : null;
-  console.warn('MUX_DIAGNOSTICS:', {
-    videoDurationSec: lastVideoSample.cts / video.timescale,
-    audioDurationSec: audio && lastAudioSample ? lastAudioSample.cts / audio.timescale : 0,
-    videoTimescale: video.timescale,
-    audioTimescale: audio ? audio.timescale : 0,
-    movieDuration: file.moov?.mvhd?.duration,
-    movieTimescale: file.moov?.mvhd?.timescale ?? movieTimescale,
+    const cts = toUs(s.cts, video.timescale);
+    const cto = toUs(s.cts - s.dts, video.timescale);
+    muxer.addVideoChunkRaw(s.data, s.isSync ? 'key' : 'delta', cts, toUs(Math.max(1, s.duration), video.timescale), meta, cto);
   });
 
-  // HARD OVERRIDE: Fix the poisoned track headers inherited from the source
-  const videoDurationSec = videoDur / video.timescale;
-  const audioDurationSec = audio && audio.samples.length > 0 ? sumDurations(audio.samples) / audio.timescale : 0;
-  const targetMovieDuration = Math.round(videoDurationSec * 1000);
+  if (audio && audio.samples.length > 0) {
+    if (!audio.esdsDescriptor) throw new Error('mux: audio track needs esdsDescriptor');
+    const asc = extractAscFromDescriptor(audio.esdsDescriptor);
+    if (!asc) throw new Error('mux: audio esds has no AudioSpecificConfig');
+    const aot = asc[0] >> 3;
+    const meta = {
+      decoderConfig: {
+        codec: `mp4a.40.${aot}`,
+        description: asc,
+        numberOfChannels: audio.channelCount,
+        sampleRate: audio.sampleRate,
+      },
+    };
+    audio.samples.forEach((s, i) => {
+      muxer.addAudioChunkRaw(
+        s.data,
+        'key',
+        toUs(s.dts, audio!.timescale),
+        toUs(Math.max(1, s.duration), audio!.timescale),
+        i === 0 ? meta : undefined,
+      );
+    });
+  }
 
-  file.moov?.traks?.forEach((trak: any) => {
-    const isVideo = trak.mdia.hdlr.handler === 'vide';
-
-    // 1. Fix tkhd.duration (expressed in MOVIE timescale)
-    if (trak.tkhd) {
-      trak.tkhd.set('duration', targetMovieDuration);
-    }
-
-    // 2. Fix mdhd.duration (expressed in TRACK timescale)
-    if (trak.mdia?.mdhd) {
-      const trackTimescale = trak.mdia.mdhd.timescale;
-      const trackDurationSec = isVideo ? videoDurationSec : audioDurationSec;
-      trak.mdia.mdhd.set('duration', Math.round(trackDurationSec * trackTimescale));
-    }
-  });
-
-  const buffer = file.getBuffer();
-  return new Uint8Array(buffer.slice(0));
+  muxer.finalize();
+  return new Uint8Array(target.buffer);
 }
