@@ -90,6 +90,9 @@ async function drainVideoQueueAsync(st: RenderState): Promise<void> {
         const frame = st.videoQueue.shift();
         if (!frame) break;
         enc.encode(frame, { keyFrame: st.samplesWritten % 60 === 0 });
+        // Encoder has what it needs the moment encode() returns — close
+        // immediately or every composited frame leaks until GC warns.
+        frame.close();
         st.samplesWritten++;
       }
       if (st.videoQueue.length > 0) {
