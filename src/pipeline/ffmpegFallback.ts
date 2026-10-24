@@ -119,6 +119,9 @@ export async function renderClipViaFfmpeg(
   const hasAudio = Boolean(source.audioCodec);
 
   const ffmpeg = new FFmpeg();
+  // The output is hard-capped at the cut length (-t below): this path never
+  // passes through the muxToMp4 video-master cap of PR #6.
+  const cutSec = spec.sourceEndSec - spec.sourceStartSec;
   onProgress({ pct: 0, note: 'loading ffmpeg' });
   const assembledWasmURL = await resolveWasmURL();
   try {
@@ -228,7 +231,14 @@ export async function renderClipViaFfmpeg(
         off += chunk.length;
       }
       pcmChunks.length = 0;
-      await ffmpeg.writeFile('a.wav', wavFromFloat32(joined, audioRate || 48000, audioChannels || 2));
+      // Hard-trim the PCM to exactly the cut length: packet selection can
+      // over-collect when source metadata lies, and this WAV's length flows
+      // straight into the container (there is no muxToMp4 cap on this path).
+      const rate = audioRate || 48000;
+      const ch = audioChannels || 2;
+      const keep = Math.max(1, Math.floor(cutSec * rate)) * ch;
+      const pcm = joined.length > keep ? joined.slice(0, keep) : joined;
+      await ffmpeg.writeFile('a.wav', wavFromFloat32(pcm, rate, ch));
       wroteWav = true;
     }
 
@@ -251,6 +261,10 @@ export async function renderClipViaFfmpeg(
       '-pix_fmt',
       'yuv420p',
       ...(wroteWav ? ['-c:a', 'aac', '-b:a', '128k', '-shortest'] : []),
+      // Hard duration cap: the container can NEVER exceed the cut length,
+      // regardless of what any stream claims (belt alongside -shortest).
+      '-t',
+      cutSec.toFixed(3),
       '-movflags',
       '+faststart',
       'out.mp4',

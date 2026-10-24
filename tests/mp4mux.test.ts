@@ -851,3 +851,76 @@ describe('duration timeline = stts pts span (poisoned-mdhd regression, §8.10)',
     expect(encodeFramerateFromPts(0, 99 * 40_000, 100, Number.NaN)).toBeCloseTo(25, 6);
   });
 });
+
+describe('ffmpeg fallback arg contract (§8.11 duration cap)', () => {
+  const FB = `${DIR}/fallback`;
+
+  it('never exceeds the cut: -t caps the container even with 2× audio (-shortest belt alongside)', () => {
+    // Reproduces the reported fallback bug shape with the fallback's exact
+    // input construction: image2 frames for 4s of video + a WAV twice as
+    // long as the video (poisoned-stts PCM extraction). Without duration
+    // flags the container follows the LONGEST stream → video ends at 4s and
+    // freezes while the timeline runs to 8s — the reported 30s+30s freeze.
+    mkdirSync(FB, { recursive: true });
+    const first = `${FB}/f000001.jpg`;
+    if (!existsSync(first)) {
+      const gen = spawnSync(
+        ffmpegPath,
+        [
+          '-y', '-v', 'error', '-f', 'lavfi',
+          '-i', 'testsrc2=size=320x240:rate=25:duration=4',
+          '-frames:v', '100',
+          `${FB}/f%06d.jpg`,
+        ],
+        { encoding: 'utf8' },
+      );
+      expect(gen.status, gen.stderr).toBe(0);
+    }
+    const wav = `${FB}/a.wav`;
+    if (!existsSync(wav)) {
+      const gen = spawnSync(
+        ffmpegPath,
+        ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=8', '-ac', '2', wav],
+        { encoding: 'utf8' },
+      );
+      expect(gen.status, gen.stderr).toBe(0);
+    }
+    const CUT = 4;
+
+    const run = (out: string, args: string[]): Probe => {
+      const r = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+      expect(r.status, r.stderr).toBe(0);
+      return ffprobe(out);
+    };
+    const baseInputs = ['-framerate', '25.000000', '-i', `${FB}/f%06d.jpg`, '-i', wav];
+    const encode = [
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '128k',
+    ];
+
+    // Control: no duration flags → container = longest stream (8s) while
+    // video is only 4s — the freeze pattern under test.
+    const ctrl = run(`${FB}/out_none.mp4`, [...baseInputs, ...encode, '-movflags', '+faststart', `${FB}/out_none.mp4`]);
+    expect(Number(ctrl.format.duration)).toBeGreaterThan(7.5);
+    expect(Number(ctrl.streams.find((s) => s.codec_type === 'video')!.duration)).toBeLessThan(4.5);
+
+    // '-t' alone must cap the container at the cut…
+    const tOnly = run(`${FB}/out_t.mp4`, [...baseInputs, ...encode, '-t', CUT.toFixed(3), '-movflags', '+faststart', `${FB}/out_t.mp4`]);
+    expect(Number(tOnly.format.duration)).toBeLessThan(CUT + 0.05);
+
+    // …and the shipped argument set (-shortest + -t) caps every duration
+    // source: container, video stream, audio stream.
+    const shipped = run(`${FB}/out_ship.mp4`, [
+      ...baseInputs,
+      ...encode,
+      '-shortest',
+      '-t', CUT.toFixed(3),
+      '-movflags', '+faststart',
+      `${FB}/out_ship.mp4`,
+    ]);
+    expect(Number(shipped.format.duration)).toBeLessThan(CUT + 0.05);
+    expect(Number(shipped.streams.find((s) => s.codec_type === 'video')!.duration)).toBeLessThan(CUT + 0.05);
+    expect(Number(shipped.streams.find((s) => s.codec_type === 'audio')!.duration)).toBeLessThan(CUT + 0.05);
+    expectCleanDecode(`${FB}/out_ship.mp4`);
+  }, 120_000);
+});
