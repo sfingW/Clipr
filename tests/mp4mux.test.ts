@@ -888,7 +888,7 @@ describe('ffmpeg fallback arg contract (§8.11 duration cap)', () => {
     const CUT = 4;
 
     const run = (out: string, args: string[]): Probe => {
-      const r = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+      const r = spawnSync(ffmpegPath, ['-y', ...args], { encoding: 'utf8' });
       expect(r.status, r.stderr).toBe(0);
       return ffprobe(out);
     };
