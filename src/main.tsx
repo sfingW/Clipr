@@ -2,7 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './app/App';
 import { useAppStore } from './app/store';
-import { detectTier } from './app/tiers';
+import { detectTier, probeWebGpu } from './app/tiers';
 import './styles/global.css';
 
 const container = document.getElementById('root');
@@ -19,4 +19,9 @@ createRoot(container).render(
 // Capability detection runs at startup (SPEC §11); Phase 0 returns 'basic'.
 void detectTier().then((tier) => {
   useAppStore.getState().setTier(tier);
+});
+
+// WebGPU gates the AI scoring controls (SPEC §8.6, §11); the cutter never waits on it.
+void probeWebGpu().then((ok) => {
+  useAppStore.getState().setWebGpu(ok ? 'available' : 'unavailable');
 });

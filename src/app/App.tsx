@@ -61,6 +61,8 @@ export default function App() {
   const fileRef = useRef<File | null>(null);
   const jobIdRef = useRef<string | null>(null);
   const busy = jobState === 'ingesting' || jobState === 'rendering' || jobState === 'exporting';
+  /** AI scoring holds the job in llm_loading/scoring; export must wait (SPEC §10). */
+  const scoring = jobState === 'llm_loading' || jobState === 'scoring';
 
   const adoptOpened = useCallback(
     (opened: OpenedJob): void => {
@@ -133,7 +135,7 @@ export default function App() {
   );
 
   const handleExport = useCallback((): void => {
-    if (!source || !clip || busy) return;
+    if (!source || !clip || busy || scoring) return;
     const current = useAppStore.getState().jobState;
     if (current === 'done') setJobState('ready');
     setJobState('rendering');
@@ -155,7 +157,7 @@ export default function App() {
         setJobState('ready');
         setError(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
       });
-  }, [source, clip, busy, runRender, setJobState, setProgress, setError]);
+  }, [source, clip, busy, scoring, runRender, setJobState, setProgress, setError]);
 
 /** Start over with a different file — closes the demux session and drops
  * the stored source (deliberate switch, not a §20 failure: no keep needed). */
@@ -294,7 +296,7 @@ export default function App() {
               clip={clip}
               onExport={handleExport}
               onDownloadRaw={handleDownloadRaw}
-              busy={busy}
+              busy={busy || scoring}
               resultUrl={resultUrl}
             />
           ) : null}

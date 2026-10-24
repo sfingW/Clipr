@@ -578,3 +578,99 @@ kbd {
   outline: 2px solid #7c9cff;
   outline-offset: 1px;
 }
+
+/* Phase 4: AI candidate panel */
+.candidates {
+  background: #14141b;
+  border: 1px solid #26262e;
+  border-radius: 12px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.candidates__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.candidates__title {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.candidates__progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: #b8b8c6;
+}
+
+.candidates__bar {
+  width: 100%;
+}
+
+.candidates__notice,
+.candidates__empty {
+  font-size: 0.85rem;
+  color: #b8b8c6;
+  margin: 0;
+}
+
+.candidates__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+.candidate {
+  width: 100%;
+  text-align: left;
+  background: #1d1d26;
+  border: 1px solid #33333d;
+  border-radius: 8px;
+  color: inherit;
+  padding: 0.5rem 0.65rem;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.candidate:hover {
+  border-color: #5a5a6a;
+}
+
+.candidate--selected {
+  border-color: #ffd60a;
+}
+
+.candidate__head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+}
+
+.candidate__score {
+  font-weight: 700;
+  color: #ffd60a;
+}
+
+.candidate__time,
+.candidate__snippet {
+  color: #9a9aaa;
+  font-size: 0.8rem;
+}
+
+.candidate__reason {
+  font-size: 0.85rem;
+}

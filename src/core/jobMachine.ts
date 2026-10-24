@@ -6,6 +6,8 @@
  *                                                 → llm_loading → scoring → candidates_ready
  *                                                                      → ready           (user can edit & export)
  *                                                                      → rendering → exporting → done
+ *   ready → llm_loading: the user starts AI scoring from the ready cutter (Phase 4).
+ *   The transcript path ends at `ready`, so this edge is how scoring starts.
  *
  * Rules:
  * - `transcript_ready` implies the cutter is usable.
@@ -47,7 +49,8 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = 
   llm_loading: ['scoring', 'candidates_ready'],
   scoring: ['candidates_ready'],
   candidates_ready: ['ready'],
-  ready: ['rendering', 'idle'],
+  // `llm_loading` is the user's "Find Best Clips" action (Phase 4).
+  ready: ['rendering', 'idle', 'llm_loading'],
   rendering: ['exporting', 'ready'],
   exporting: ['done', 'ready'],
   done: ['idle', 'ready'], // 'ready' = export another clip from the same source
