@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -67,6 +68,19 @@ function splitOversizedWasmAssets(): Plugin {
 
 export default defineConfig({
   plugins: [react(), splitOversizedWasmAssets()],
+  resolve: {
+    alias: [
+      // Transformers.js imports the WebGPU ONNX Runtime build, which bundles the
+      // asyncify WASM variant (~27 MB, over the Cloudflare asset cap) and the
+      // threaded WASM (14 MB, a second copy of public/ort/). The app only runs the
+      // CPU/WASM device and self-hosts the WASM (scripts/copy-ort.mjs), so use the
+      // external-WASM loader: it references no WASM asset for Vite to emit.
+      {
+        find: /^onnxruntime-web\/webgpu$/,
+        replacement: fileURLToPath(new URL('./node_modules/onnxruntime-web/dist/ort.wasm.min.mjs', import.meta.url)),
+      },
+    ],
+  },
   build: {
     outDir: 'dist',
     rollupOptions: {

@@ -11,6 +11,8 @@
  * - `transcript_ready` implies the cutter is usable.
  * - `ready` is entered as soon as either transcript OR candidates exist —
  *   and in Phase 1 (no AI) directly from `ingesting_done`.
+ * - Export (`rendering`) is allowed from any ASR state: the cutter works before
+ *   the transcript exists, so ASR must not block export.
  * - Failure of `asr_*`/`llm_*` degrades (skips forward), never fails the job.
  * - `rendering` failures return to `ready` with a surfaced error (§10, §20).
  * - Ingest failure returns to `idle` with a surfaced error.
@@ -37,9 +39,11 @@ export const JOB_TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = 
   idle: ['ingesting'],
   ingesting: ['ingesting_done', 'idle'],
   ingesting_done: ['ready', 'asr_loading'],
-  asr_loading: ['asr_running', 'transcript_ready'],
-  asr_running: ['transcript_ready'],
-  transcript_ready: ['llm_loading', 'ready'],
+  // ASR degrades, never fails the job: any asr_* state can fall back to `ready`
+  // (manual cutting). Export is allowed while ASR runs (the cutter is usable).
+  asr_loading: ['asr_running', 'transcript_ready', 'ready', 'rendering'],
+  asr_running: ['transcript_ready', 'ready', 'rendering'],
+  transcript_ready: ['llm_loading', 'ready', 'rendering'],
   llm_loading: ['scoring', 'candidates_ready'],
   scoring: ['candidates_ready'],
   candidates_ready: ['ready'],

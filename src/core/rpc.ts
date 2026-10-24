@@ -16,7 +16,7 @@ export type Progress = {
   id: string;
   pct: number;
   note?: string;
-  stage?: 'ingest' | 'asr' | 'scoring' | 'vision' | 'rendering';
+  stage?: 'ingest' | 'asr' | 'asr_loading' | 'asr_running' | 'scoring' | 'vision' | 'rendering';
   etaSec?: number;
   done?: number;
   total?: number;
@@ -108,6 +108,12 @@ export interface DemuxWorker {
     payload: Record<string, never>;
     result: void;
   };
+  /** Decode the source audio to 16 kHz mono float32 WAV in OPFS (SPEC §8.3). */
+  'demux.extractAudio': {
+    /** `sourceOpfsPath` guards against a source being swapped mid-extraction. */
+    payload: { sourceOpfsPath: string; outPath: string; sampleRate: number; maxDurationSec: number };
+    result: { opfsPath: string; durationSec: number; sampleCount: number };
+  };
 }
 
 /** Default request timeouts (SPEC §9): 10 min render, 5 min ASR; configurable per request. */
@@ -149,6 +155,11 @@ export interface RpcClient<M extends { [K in keyof M]: MethodShape }> {
       onProgress?: ProgressHandler;
       /** Pre-generate the request id so streams can target it immediately. */
       requestId?: string;
+      /**
+       * Treat `timeoutMs` as an idle timeout: every progress message re-arms
+       * the timer. Long jobs that keep reporting progress never time out.
+       */
+      resetOnProgress?: boolean;
     },
   ): Promise<M[K]['result']>;
   sendStream(msg: StreamMessage): void;
@@ -163,6 +174,8 @@ interface Pending {
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout> | null;
   onProgress?: ProgressHandler;
+  /** Re-arm `timer` on every progress message (idle timeout). */
+  idleTimeoutMs?: number;
 }
 
 function rpcError(message: string, code?: string): Error {
@@ -187,6 +200,14 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
     return p;
   };
 
+  const armTimer = (id: string, entry: Pending, ms: number): void => {
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      cleanup(id);
+      entry.reject(new Error(`rpc timeout: ${entry.type} after ${ms}ms`));
+    }, ms);
+  };
+
   worker.addEventListener('message', (event: MessageEvent<unknown>) => {
     const msg = event.data as
       | Response<string, unknown>
@@ -203,7 +224,9 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
     }
     if (msg && 'pct' in msg && 'id' in msg && !('ok' in msg)) {
       const progress = msg as Progress;
-      pending.get(progress.id)?.onProgress?.(progress);
+      const entry = pending.get(progress.id);
+      if (entry?.idleTimeoutMs !== undefined) armTimer(progress.id, entry, entry.idleTimeoutMs);
+      entry?.onProgress?.(progress);
       for (const h of progressHandlers) h(progress);
       return;
     }
@@ -236,11 +259,9 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
           reject,
           timer: null,
           onProgress: opts?.onProgress,
+          idleTimeoutMs: opts?.resetOnProgress ? timeoutMs : undefined,
         };
-        entry.timer = setTimeout(() => {
-          cleanup(id);
-          reject(new Error(`rpc timeout: ${type} after ${timeoutMs}ms`));
-        }, timeoutMs);
+        armTimer(id, entry, timeoutMs);
         pending.set(id, entry);
         worker.postMessage({ id, type, payload } satisfies Request<string, unknown>);
       });

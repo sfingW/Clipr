@@ -14,6 +14,8 @@ import TranscriptPane from '../components/TranscriptPane';
 import CandidateList from '../components/CandidateList';
 import ModelStatus from '../components/ModelStatus';
 import { useAppStore } from './store';
+import { getAsrClient, getDemuxClient } from './workers';
+import { defaultTranscribeDeps, runTranscription } from '../pipeline/transcribe';
 import { ingestFile, resumeFromOpfs, IngestError, type OpenedJob } from '../pipeline/ingest';
 import { renderClipToBlob, isCodecUnsupported, type RenderProgress } from '../pipeline/render';
 import { renderClipViaFfmpeg } from '../pipeline/ffmpegFallback';
@@ -33,6 +35,11 @@ function wholeFileClip(source: SourceMeta): ClipSpec {
   };
 }
 
+/** ASR runs after ingest (SPEC §3 step 3); never blocks the cutter. */
+function startTranscription(source: SourceMeta): void {
+  void runTranscription(source, defaultTranscribeDeps(getDemuxClient, getAsrClient));
+}
+
 export default function App() {
   const jobState = useAppStore((s) => s.jobState);
   const source = useAppStore((s) => s.source);
@@ -44,6 +51,7 @@ export default function App() {
   const setProgress = useAppStore((s) => s.setProgress);
   const setError = useAppStore((s) => s.setError);
   const setCut = useAppStore((s) => s.setCut);
+  const resetJob = useAppStore((s) => s.resetJob);
 
   const [resumeIds, setResumeIds] = useState<string[]>([]);
   const [bgWarning, setBgWarning] = useState<string | null>(null);
@@ -67,7 +75,8 @@ export default function App() {
       setProgress(null);
       setError(null);
       setJobState('ingesting_done');
-      setJobState('ready');
+      // Cutting works now; the transcript arrives later and moves the job on.
+      startTranscription(opened.source);
     },
     [setSource, setClips, setActiveClip, setProgress, setError, setJobState],
   );
@@ -81,6 +90,8 @@ export default function App() {
         if (prev) URL.revokeObjectURL(prev);
         return null;
       });
+      // The previous job may still be transcribing; abandon it explicitly.
+      resetJob();
       setJobState('ingesting');
       setProgress({ stage: 'ingest', pct: 0, note: 'starting' });
       void ingestFile(file, {
@@ -97,7 +108,7 @@ export default function App() {
           );
         });
     },
-    [busy, adoptOpened, setJobState, setProgress, setError],
+    [busy, adoptOpened, resetJob, setJobState, setProgress, setError],
   );
 
   /** WebCodecs first, FFmpeg fallback on codec rejection (SPEC §8.11). */
@@ -162,12 +173,12 @@ export default function App() {
     setActiveClip(null);
     setProgress(null);
     setError(null);
-    setJobState('idle');
+    resetJob();
     void (async () => {
       if (oldJob) await removeJob(oldJob).catch(() => undefined);
       setResumeIds(await listJobs());
     })();
-  }, [busy, setSource, setClips, setActiveClip, setProgress, setError, setJobState]);
+  }, [busy, setSource, setClips, setActiveClip, setProgress, setError, resetJob]);
 
   const handleDownloadRaw = useCallback((): void => {
     const file = fileRef.current;
@@ -189,6 +200,7 @@ export default function App() {
     const [jobId] = resumeIds;
     if (!jobId) return;
     setError(null);
+    resetJob();
     setJobState('ingesting');
     setProgress({ stage: 'ingest', pct: 50, note: 'resuming' });
     void resumeFromOpfs(jobId)
@@ -198,7 +210,7 @@ export default function App() {
         setJobState('idle');
         setError(err instanceof Error ? err.message : String(err));
       });
-  }, [resumeIds, adoptOpened, setJobState, setProgress, setError]);
+  }, [resumeIds, adoptOpened, resetJob, setJobState, setProgress, setError]);
 
   const discardStored = useCallback((): void => {
     void Promise.all(resumeIds.map((id) => removeJob(id))).then(() => setResumeIds([]));
