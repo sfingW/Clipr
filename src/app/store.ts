@@ -14,6 +14,23 @@ export interface JobProgress {
 }
 
 /**
+ * ASR status, kept apart from the job state (SPEC §10): the transcript pane
+ * shows progress and non-blocking errors whatever the job state is.
+ */
+export type AsrPhase = 'idle' | 'loading' | 'running' | 'ready' | 'failed' | 'skipped';
+
+export interface AsrStatus {
+  phase: AsrPhase;
+  /** 0–100 within the current phase. */
+  pct: number;
+  note: string | null;
+  /** Non-blocking, user-facing reason when `phase === 'failed'`. */
+  error: string | null;
+}
+
+export const INITIAL_ASR: AsrStatus = { phase: 'idle', pct: 0, note: null, error: null };
+
+/**
  * Store shape: job state + UI state (SPEC §6).
  * Job state follows the §10 state machine; one job per ingested file.
  */
@@ -28,8 +45,11 @@ export interface AppStore {
   activeClipId: string | null;
   progress: JobProgress | null;
   error: string | null;
+  asr: AsrStatus;
 
   // ui state
+  /** Shared playhead in source seconds: scrub position, and what the transcript highlights. */
+  playheadSec: number;
   selectedCandidateId: string | null;
   captionStyleId: string;
   exportPreset: '1080p' | '720p';
@@ -37,6 +57,12 @@ export interface AppStore {
   // job actions
   setTier: (tier: Tier) => void;
   setJobState: (state: JobState) => void;
+  /**
+   * Abandon the current job and return to `idle` from any state, so a new file
+   * can start while the previous job's ASR is still running. Its late results
+   * are discarded by the source-id guard in `runTranscription`.
+   */
+  resetJob: () => void;
   setSource: (source: SourceMeta | null) => void;
   /** Frame-accurate in/out for the active clip (SPEC §8.6). */
   setCut: (startSec: number, endSec: number) => void;
@@ -47,8 +73,10 @@ export interface AppStore {
   setActiveClip: (id: string | null) => void;
   setProgress: (progress: JobProgress | null) => void;
   setError: (error: string | null) => void;
+  setAsr: (patch: Partial<AsrStatus>) => void;
 
   // ui actions
+  setPlayhead: (sec: number) => void;
   selectCandidate: (id: string | null) => void;
   setCaptionStyle: (id: string) => void;
   setExportPreset: (preset: '1080p' | '720p') => void;
@@ -64,7 +92,9 @@ export const useAppStore = create<AppStore>()((set) => ({
   activeClipId: null,
   progress: null,
   error: null,
+  asr: INITIAL_ASR,
 
+  playheadSec: 0,
   selectedCandidateId: null,
   captionStyleId: 'bold-center',
   exportPreset: '1080p',
@@ -72,7 +102,10 @@ export const useAppStore = create<AppStore>()((set) => ({
   setTier: (tier) => set({ tier }),
   setJobState: (jobState) =>
     set((s) => (s.jobState === jobState || canTransition(s.jobState, jobState) ? { jobState } : s)),
-  setSource: (source) => set({ source }),
+  // A new source invalidates everything derived from the previous one.
+  resetJob: () => set({ jobState: 'idle' }),
+  setSource: (source) =>
+    set({ source, transcript: null, asr: INITIAL_ASR, playheadSec: 0, candidates: [], selectedCandidateId: null }),
   setCut: (startSec, endSec) =>
     set((s) => ({
       clips: s.clips.map((c) =>
@@ -89,7 +122,9 @@ export const useAppStore = create<AppStore>()((set) => ({
   setActiveClip: (activeClipId) => set({ activeClipId }),
   setProgress: (progress) => set({ progress }),
   setError: (error) => set({ error }),
+  setAsr: (patch) => set((s) => ({ asr: { ...s.asr, ...patch } })),
 
+  setPlayhead: (playheadSec) => set({ playheadSec: Math.max(0, playheadSec) }),
   selectCandidate: (selectedCandidateId) => set({ selectedCandidateId }),
   setCaptionStyle: (captionStyleId) => set({ captionStyleId }),
   setExportPreset: (exportPreset) => set({ exportPreset }),

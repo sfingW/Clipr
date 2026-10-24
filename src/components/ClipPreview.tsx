@@ -4,9 +4,13 @@
  * demux worker (decode-on-scrub) — no proxy track, no <video> element:
  * the source lives in OPFS, and `demux.frameAt` does keyframe-seek +
  * sequential decode so any frame is exact.
+ *
+ * The position is the shared playhead (store `playheadSec`): the transcript
+ * seeks it by clicking a word. Real playback is a follow-up (no media element).
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getDemuxClient } from '../app/workers';
+import { useAppStore } from '../app/store';
 import type { ClipSpec, SourceMeta } from '../core/types';
 
 export interface ClipPreviewProps {
@@ -25,7 +29,9 @@ function fmt(t: number): string {
 
 export default function ClipPreview({ source, clip, onCut }: ClipPreviewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [scrubSec, setScrubSec] = useState(() => clip.sourceStartSec);
+  // The playhead lives in the store so the transcript can seek and highlight it.
+  const scrubSec = useAppStore((s) => s.playheadSec);
+  const setScrubSec = useAppStore((s) => s.setPlayhead);
   const [decodeErr, setDecodeErr] = useState<string | null>(null);
   const requestToken = useRef(0);
 

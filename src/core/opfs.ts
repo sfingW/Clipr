@@ -78,6 +78,14 @@ export async function writeStreaming(
   }
 }
 
+/**
+ * Get-or-create a file handle (creating parent directories). Used by workers
+ * that stream into a file via `createSyncAccessHandle()` (dedicated workers only).
+ */
+export async function ensureFileHandle(path: string): Promise<FileSystemFileHandle> {
+  return handleForPath(path, true);
+}
+
 export async function getFileHandle(path: string): Promise<FileSystemFileHandle> {
   return handleForPath(path, false);
 }

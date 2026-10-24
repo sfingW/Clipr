@@ -19,6 +19,13 @@ import {
   type ParsedTrack,
 } from '../core/mp4Parse';
 import { aacAccessUnitFrames, extractAscFromDescriptor } from '../core/mp4Mux';
+import { ensureFileHandle } from '../core/opfs';
+import {
+  SincResampler,
+  WAV_HEADER_BYTES,
+  downmixToMono,
+  wavFloat32Header,
+} from '../pipeline/audioExtract';
 import {
   serveRpc,
   type DemuxWorker as DemuxMethods,
@@ -28,7 +35,16 @@ import {
 } from '../core/rpc';
 import type { SourceMeta } from '../core/types';
 
+/** Subset of FileSystemSyncAccessHandle used here (not in the DOM typings). */
+interface SyncAccessHandle {
+  write(buf: ArrayBufferView, opts: { at: number }): number;
+  truncate(size: number): void;
+  flush(): void;
+  close(): void;
+}
+
 interface Session {
+  opfsPath: string;
   handle: FileSystemFileHandle;
   reader: ByteRangeReader;
   parsed: ParsedMp4;
@@ -166,7 +182,14 @@ async function open(payload: DemuxMethods['demux.open']['payload']): Promise<Sou
   const avcC = vt.stsdEntry?.avcC ?? vt.stsdEntry?.boxes?.find((b) => b.type === 'avcC');
   if (!avcC) throw new Error('missing-avcc: video track has no avcC decoder config');
 
-  const next: Session = { handle: payload.handle, reader, parsed, fps: 0, avcC: new Uint8Array(0) };
+  const next: Session = {
+    opfsPath: payload.opfsPath,
+    handle: payload.handle,
+    reader,
+    parsed,
+    fps: 0,
+    avcC: new Uint8Array(0),
+  };
   session = next; // boxContent needs session set before reading avcC
   next.avcC = await boxContent(avcC);
   next.fps = frameRateOf(vt, parsed.durationSec);
@@ -561,6 +584,137 @@ async function close(): Promise<void> {
   session = null;
 }
 
+/** Downmix one decoded AudioData to mono Float32 (any channel layout/format). */
+function audioDataToMono(data: AudioData): Float32Array {
+  const ch = data.numberOfChannels;
+  const frames = data.numberOfFrames;
+  const planes: Float32Array[] = [];
+  if (data.format === 'f32-planar') {
+    for (let c = 0; c < ch; c++) {
+      const p = new Float32Array(frames);
+      data.copyTo(p, { planeIndex: c });
+      planes.push(p);
+    }
+  } else {
+    // Interleaved or integer formats: ask WebCodecs for planar float32.
+    for (let c = 0; c < ch; c++) {
+      const p = new Float32Array(frames);
+      data.copyTo(p, { planeIndex: c, format: 'f32-planar' });
+      planes.push(p);
+    }
+  }
+  return downmixToMono(planes);
+}
+
+/** Batch size (AAC access units, ~2.5 s) between decode-lock releases. */
+const EXTRACT_BATCH = 120;
+
+/**
+ * Decode the whole audio track → 16 kHz mono float32 WAV at `outPath` (SPEC
+ * §8.3). One AudioDecoder is kept for the whole file (no per-batch reset of
+ * the AAC overlap state). Each batch of packets runs under the decode lock, so
+ * frame requests from the UI are served between batches.
+ */
+async function extractAudioInner(
+  payload: DemuxMethods['demux.extractAudio']['payload'],
+  ctx: RpcServerContext,
+): Promise<DemuxMethods['demux.extractAudio']['result']> {
+  const sess = session;
+  if (!sess) throw new Error('no source open');
+  if (sess.opfsPath !== payload.sourceOpfsPath) {
+    throw new Error('stale-source: another file was opened during audio extraction');
+  }
+  const audio = sess.parsed.audio;
+  if (!audio?.table) throw new Error('no-audio-track: source has no audio to transcribe');
+  const table = audio.table;
+  const esdsBox = audio.stsdEntry?.esds ?? audio.stsdEntry?.boxes?.find((b) => b.type === 'esds');
+  const descriptor = esdsBox ? await boxContent(esdsBox) : null;
+  const asc = descriptor ? extractAscFromDescriptor(descriptor) : null;
+  const config: AudioDecoderConfig = {
+    codec: audio.codec,
+    sampleRate: audio.sampleRate ?? 48000,
+    numberOfChannels: audio.channelCount ?? 2,
+    ...(asc ? { description: asc } : {}),
+  };
+  const outRate = payload.sampleRate;
+  // Never produce audio past the video's end (SPEC §8.3 cap).
+  const cap = payload.maxDurationSec > 0 ? Math.floor(payload.maxDurationSec * outRate) : Infinity;
+
+  const resampler = new SincResampler(config.sampleRate!, outRate);
+  // Sync access handles exist only in dedicated workers (not in the DOM typings).
+  const fh = (await ensureFileHandle(payload.outPath)) as FileSystemFileHandle & {
+    createSyncAccessHandle(): Promise<SyncAccessHandle>;
+  };
+  const sync = await fh.createSyncAccessHandle();
+  let written = 0;
+  let writePos = WAV_HEADER_BYTES;
+  const writeSamples = (pcm: Float32Array): void => {
+    const room = cap - written;
+    const s = pcm.length > room ? pcm.subarray(0, Math.max(0, room)) : pcm;
+    if (s.length === 0) return;
+    // Little-endian on every platform the app runs on (WAV is LE).
+    sync.write(new Uint8Array(s.buffer, s.byteOffset, s.byteLength), { at: writePos });
+    writePos += s.byteLength;
+    written += s.length;
+  };
+
+  const queue: AudioData[] = [];
+  let decErr: Error | null = null;
+  let dec: AudioDecoder | null = null;
+  try {
+    sync.truncate(0);
+    sync.write(new Uint8Array(WAV_HEADER_BYTES), { at: 0 }); // patched at the end
+    try {
+      dec = new AudioDecoder({
+        output: (data) => queue.push(data),
+        error: (e) => {
+          decErr = e instanceof Error ? e : new Error(String(e));
+        },
+      });
+      dec.configure(config);
+    } catch (err) {
+      throw tagged('AUDIO_DECODER_UNSUPPORTED', err);
+    }
+    const drain = (): void => {
+      for (const data of queue.splice(0)) {
+        try {
+          writeSamples(resampler.push(audioDataToMono(data)));
+        } finally {
+          data.close();
+        }
+      }
+    };
+    const total = table.count;
+    for (let start = 0; start < total && written < cap; start += EXTRACT_BATCH) {
+      if (session !== sess) throw new Error('stale-source: another file was opened during audio extraction');
+      const end = Math.min(total, start + EXTRACT_BATCH);
+      await withDecodeLock(async () => {
+        for (let i = start; i < end; i++) {
+          const data = await sess.reader(table.offsets[i], table.sizes[i]);
+          dec!.decode(
+            new EncodedAudioChunk({ type: 'key', timestamp: toUs(table.pts[i], audio.timescale), data }),
+          );
+        }
+        await dec!.flush();
+        if (decErr) throw decErr;
+        drain();
+      });
+      ctx.progress(Math.round((end / total) * 100), { stage: 'asr_loading', note: 'decoding audio' });
+    }
+    writeSamples(resampler.flush());
+    sync.write(wavFloat32Header(written, outRate, 1), { at: 0 });
+    sync.truncate(WAV_HEADER_BYTES + written * 4);
+    sync.flush();
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('stale-source')) throw err;
+    throw tagged('AUDIO_EXTRACT_FAILED', err);
+  } finally {
+    if (dec && dec.state !== 'closed') dec.close();
+    sync.close();
+  }
+  return { opfsPath: payload.outPath, durationSec: written / outRate, sampleCount: written };
+}
+
 serveRpc<DemuxMethods>(
   self as unknown as {
     addEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
@@ -571,5 +725,7 @@ serveRpc<DemuxMethods>(
     'demux.frameAt': (payload) => withDecodeLock(() => frameAtInner(payload)),
     'demux.streamClip': (payload, ctx) => withDecodeLock(() => streamClipInner(payload, ctx)),
     'demux.close': () => withDecodeLock(() => close()),
+    // Not wrapped in withDecodeLock: each batch takes the lock itself.
+    'demux.extractAudio': (payload, ctx) => extractAudioInner(payload, ctx),
   },
 );
