@@ -307,8 +307,13 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     }
   }
 
-  // Durations (mp4box leaves them at 0 otherwise).
-  const movieTimescale = file.moov?.mvhd?.timescale ?? video.timescale;
+  // Durations (mp4box leaves them at 0 otherwise). The MOVIE header is
+  // forced to standard milliseconds (1000), never whatever timescale the
+  // source or mp4box's init() carried over (a poisoned ~15000 made a
+  // 30.73s cut play as 61s: 921000/15000). mvhd.duration = video duration
+  // in ms = Math.round(videoDurationSec * 1000); tkhd durations live in
+  // mvhd units too, so they convert through the same 1000.
+  const movieTimescale = 1000;
   const videoMovieDur = Math.round((videoDur * movieTimescale) / video.timescale);
   const vtrak = file.getTrackById(videoTrackId);
   vtrak?.mdia?.mdhd?.set?.('duration', videoDur);
@@ -322,6 +327,7 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     // never exceed videoMovieDur — but the container follows VIDEO either
     // way: mvhd.duration = video track duration, exactly (master clock).
   }
+  file.moov?.mvhd?.set?.('timescale', movieTimescale);
   file.moov?.mvhd?.set?.('duration', videoMovieDur);
 
   // Diagnostic (requested): the exact durations written into the file,

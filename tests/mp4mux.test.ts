@@ -596,7 +596,7 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     const md1Ts = buf.readUInt32BE(mds[1] + 20);
     const md1Dur = buf.readUInt32BE(mds[1] + 24);
 
-    expect(mvTs).toBe(v.timescale); // mvhd adopts the first track's timescale
+    expect(mvTs).toBe(1000); // mvhd forced to standard ms — independent of any source timescale
     expect(md0Ts).toBe(v.timescale);
     expect(md0Dur).toBe(expVideo); // media duration = Σ sample durations
     expect(md1Ts).toBe(a.timescale);
