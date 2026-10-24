@@ -610,6 +610,177 @@ describe('muxToMp4 (§8.10, mp4box as the only muxer)', () => {
     expect(mvDur / mvTs).toBeCloseTo(16.0, 1);
   }, 60_000);
 
+  it('writes tkhd/mdhd durations for the cut length (10.0s), not the 16s source', async () => {
+    // Regression: the player timeline must follow the CUT, so every duration
+    // field in the output buffer (tkhd in movie units, mdhd in track units)
+    // has to match the 10.0s window, never the 16.0s source.
+    const f = await load(LONG);
+    cacheFile(LONG, f);
+    const v = f.parsed.video!;
+    const a = f.parsed.audio!;
+    const avcC = v.stsdEntry?.avcC ?? v.stsdEntry!.boxes!.find((b) => b.type === 'avcC')!;
+    const esds = a.stsdEntry?.esds ?? a.stsdEntry!.boxes!.find((b) => b.type === 'esds')!;
+    const asc = extractAscFromDescriptor(contentOf(f, esds));
+    expect(asc).not.toBeNull();
+    const rate = a.sampleRate ?? 44100;
+
+    const { from, to } = sampleRangeForWindow(v, 5, 15);
+    expect(to - from).toBe(250); // 10s @ 25fps
+    const videoSamples = videoSamplesFor(f, v, from, to, v.table!.dts[from]);
+    const plan = planRemuxAudio(a.table!.count, aacAccessUnitFrames(asc), rate, 5, 15)!;
+    const audioSamples: MuxSample[] = plan.indices.map((idx, k) => ({
+      data: readSync(f, a.table!.offsets[idx], a.table!.sizes[idx]),
+      ...plan.parts[k],
+      isSync: true,
+    }));
+
+    const expVideoUnits = videoSamples.reduce((acc, x) => acc + x.duration, 0);
+    const expAudioUnits = audioSamples.reduce((acc, x) => acc + x.duration, 0);
+    expect(expVideoUnits).toBe(10 * v.timescale); // exactly 10.0s of video
+    const expVideoSec = expVideoUnits / v.timescale;
+    const expAudioSec = expAudioUnits / rate;
+    expect(expVideoSec).toBeCloseTo(10.0, 6);
+
+    const mp4 = muxToMp4({
+      video: {
+        codecType: 'avc1',
+        width: v.width ?? 320,
+        height: v.height ?? 240,
+        timescale: v.timescale,
+        avcDecoderConfigRecord: contentOf(f, avcC),
+        samples: videoSamples,
+      },
+      audio: {
+        codecType: 'mp4a',
+        sampleRate: rate,
+        channelCount: a.channelCount ?? 2,
+        sampleSize: 16,
+        timescale: plan.timescale,
+        esdsDescriptor: buildEsdDescriptor(asc!),
+        samples: audioSamples,
+      },
+    });
+    const buf = Buffer.from(mp4);
+
+    // Walk the output buffer's moov → trak → {tkhd, mdia → mdhd, hdlr}.
+    const boxes = (from0: number, end: number, type: string): number[] => {
+      const acc: number[] = [];
+      let pos = from0;
+      while (pos + 8 <= end) {
+        const size = buf.readUInt32BE(pos);
+        if (size < 8) break;
+        if (buf.toString('latin1', pos + 4, pos + 8) === type) acc.push(pos);
+        pos += size;
+      }
+      return acc;
+    };
+    const moov = boxes(0, buf.length, 'moov')[0];
+    expect(moov).toBeDefined();
+    const moovEnd = moov + buf.readUInt32BE(moov);
+    const traks = boxes(moov + 8, moovEnd, 'trak');
+    expect(traks).toHaveLength(2);
+
+    const readTrak = (trakPos: number): { handler: string; tkhdDur: number; mdhdTs: number; mdhdDur: number } => {
+      const trakEnd = trakPos + buf.readUInt32BE(trakPos);
+      const tkhd = boxes(trakPos + 8, trakEnd, 'tkhd')[0];
+      const mdia = boxes(trakPos + 8, trakEnd, 'mdia')[0];
+      const mdiaEnd = mdia + buf.readUInt32BE(mdia);
+      const mdhd = boxes(mdia + 8, mdiaEnd, 'mdhd')[0];
+      const hdlr = boxes(mdia + 8, mdiaEnd, 'hdlr')[0];
+      // tkhd v0: header(8) + ver/flags(4) + ctime(4) + mtime(4) + trackId(4) + reserved(4) → duration at +28
+      expect(buf.readUInt8(tkhd + 8)).toBe(0);
+      // mdhd v0: header(8) + ver/flags(4) + ctime(4) + mtime(4) → timescale at +20, duration at +24
+      expect(buf.readUInt8(mdhd + 8)).toBe(0);
+      return {
+        handler: buf.toString('latin1', hdlr + 16, hdlr + 20),
+        tkhdDur: buf.readUInt32BE(tkhd + 28),
+        mdhdTs: buf.readUInt32BE(mdhd + 20),
+        mdhdDur: buf.readUInt32BE(mdhd + 24),
+      };
+    };
+    const vt = readTrak(traks.find((p) => readTrak(p).handler === 'vide')!);
+    const at = readTrak(traks.find((p) => readTrak(p).handler === 'soun')!);
+
+    const movieTs = buf.readUInt32BE(boxes(moov + 8, moovEnd, 'mvhd')[0] + 20);
+    expect(movieTs).toBe(1000);
+
+    // Video: tkhd in movie units = 10000 ms; mdhd in track units = 10.0s @ 12800.
+    expect(vt.tkhdDur).toBe(10_000);
+    expect(vt.mdhdTs).toBe(v.timescale);
+    expect(vt.mdhdDur).toBe(expVideoUnits);
+    expect(vt.mdhdDur / vt.mdhdTs).toBeCloseTo(10.0, 6);
+    expect(vt.tkhdDur / movieTs).toBeCloseTo(10.0, 6);
+
+    // Audio: mdhd in track units = Σ packet durations (~10s); tkhd = movie ms
+    // (the override writes the cut length into every tkhd).
+    expect(at.mdhdTs).toBe(rate);
+    // Audio packets sum past the video span (431 × 1024 = 441344), and
+    // muxToMp4's audio cap truncates the tail to the video end: 10.0s exactly.
+    expect(expAudioUnits).toBeGreaterThan(10 * rate);
+    expect(at.mdhdDur).toBe(10 * rate);
+    expect(at.mdhdDur / at.mdhdTs).toBeCloseTo(expAudioSec, 1);
+    expect(at.tkhdDur).toBe(10_000);
+
+    // Fragment timeline (moof/traf/tfdt/trun): mp4box generates these from the
+    // samples we add, so they must start at 0, run contiguously, and sum to
+    // exactly the cut length per track — no 16s or 2× values can survive.
+    const fragTotals = new Map<number, { first: number; expectedNext: number; dur: number; samples: number }>();
+    for (const moofPos of boxes(0, buf.length, 'moof')) {
+      const moofEnd = moofPos + buf.readUInt32BE(moofPos);
+      for (const trafPos of boxes(moofPos + 8, moofEnd, 'traf')) {
+        const trafEnd = trafPos + buf.readUInt32BE(trafPos);
+        const tfhd = boxes(trafPos + 8, trafEnd, 'tfhd')[0];
+        const tfdt = boxes(trafPos + 8, trafEnd, 'tfdt')[0];
+        const trunPos = boxes(trafPos + 8, trafEnd, 'trun')[0];
+        const trackId = buf.readUInt32BE(tfhd + 12);
+        expect(buf.readUInt8(tfdt + 8)).toBe(0); // tfdt v0 (32-bit)
+        const decodeTime = buf.readUInt32BE(tfdt + 12);
+
+        const flags = buf.readUInt32BE(trunPos + 8) & 0xffffff;
+        const count = buf.readUInt32BE(trunPos + 12);
+        let o = trunPos + 16;
+        if (flags & 0x1) o += 4; // data_offset
+        if (flags & 0x4) o += 4; // first_sample_flags
+        let runDur = 0;
+        for (let i = 0; i < count; i++) {
+          let d = 0;
+          if (flags & 0x100) {
+            d = buf.readUInt32BE(o);
+            o += 4;
+          }
+          if (flags & 0x200) o += 4;
+          if (flags & 0x400) o += 4;
+          if (flags & 0x800) o += 4;
+          runDur += d;
+        }
+
+        const st = fragTotals.get(trackId) ?? { first: -1, expectedNext: -1, dur: 0, samples: 0 };
+        if (st.first < 0) {
+          st.first = decodeTime;
+          expect(decodeTime).toBe(0); // timeline starts at zero
+        } else {
+          expect(decodeTime).toBe(st.expectedNext); // contiguous, no gaps/overlap
+        }
+        st.expectedNext = decodeTime + runDur;
+        st.dur += runDur;
+        st.samples += count;
+        fragTotals.set(trackId, st);
+      }
+    }
+    const vFrag = fragTotals.get(1)!;
+    const aFrag = fragTotals.get(2)!;
+    expect(vFrag.samples).toBe(250);
+    expect(vFrag.dur).toBe(expVideoUnits); // 10.0s @ 12800
+    expect(aFrag.dur).toBe(10 * rate); // 10.0s @ 44100 (capped)
+    expect(vFrag.expectedNext / v.timescale).toBeCloseTo(10.0, 6);
+    expect(aFrag.expectedNext / rate).toBeCloseTo(10.0, 6);
+
+    // Never the poisoned 2× (16s) span anywhere in the header.
+    for (const d of [vt.tkhdDur / movieTs, at.tkhdDur / movieTs, vt.mdhdDur / vt.mdhdTs, at.mdhdDur / at.mdhdTs]) {
+      expect(d).toBeLessThan(11);
+    }
+  }, 60_000);
+
   it('locks the player timeline to the video pts span even when audio claims 1.6× more', async () => {
     // Reported bug (nuclear-option spec): a 44.08s cut exported with a 2:18
     // / 3.13× player timeline — the audio track hijacked the container
