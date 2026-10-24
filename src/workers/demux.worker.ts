@@ -320,8 +320,21 @@ async function streamPcmAudio(
     const durSec = dur / audio.timescale;
     return sec + durSec > startSec && sec < endSec;
   };
-  const selected: number[] = [];
-  for (let i = 0; i < table.count; i++) if (overlap(i)) selected.push(i);
+  // AAC: pick packets from PCM frame counts (same plan as the remux path) —
+  // a broken source stts must not pull double the real audio into the PCM
+  // stream. This WAV feeds the FFmpeg fallback, which never passes through
+  // the muxToMp4 video-master cap, so over-collection here becomes a
+  // too-long container. Non-AAC keeps stts overlap (no frames-per-AU model).
+  const plan = audio.codec.startsWith('mp4a')
+    ? planRemuxAudio(table.count, aacAccessUnitFrames(asc), config.sampleRate, startSec, endSec)
+    : null;
+  const selected: number[] = plan
+    ? [...plan.indices]
+    : (() => {
+        const out: number[] = [];
+        for (let i = 0; i < table.count; i++) if (overlap(i)) out.push(i);
+        return out;
+      })();
   if (selected.length === 0) return;
 
   const CHUNK = 120; // ~2.5s of AAC frames per acked batch
@@ -349,10 +362,10 @@ async function streamPcmAudio(
         dec.decode(
           new EncodedAudioChunk({
             type: 'key',
-            // Source-stts derived (keeps window alignment with the selector);
-            // render.worker re-stamps every decoded AudioData from cumulative
-            // PCM frame counts before encoding, so mux timing never trusts
-            // this value — a broken stts must not change the output span.
+            // Source-stts derived and unused by the PCM capture (the
+            // selector above is frame-count based and the fallback only
+            // consumes decoded PCM, never AudioData timestamps); the
+            // WebCodecs pcm path re-stamps in render.worker anyway.
             timestamp: toUs(table.pts[i], audio.timescale),
             data,
           }),
