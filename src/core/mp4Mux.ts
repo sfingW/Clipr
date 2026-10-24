@@ -343,6 +343,27 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     movieTimescale: file.moov?.mvhd?.timescale ?? movieTimescale,
   });
 
+  // HARD OVERRIDE: Fix the poisoned track headers inherited from the source
+  const videoDurationSec = videoDur / video.timescale;
+  const audioDurationSec = audio && audio.samples.length > 0 ? sumDurations(audio.samples) / audio.timescale : 0;
+  const targetMovieDuration = Math.round(videoDurationSec * 1000);
+
+  file.moov?.traks?.forEach((trak: any) => {
+    const isVideo = trak.mdia.hdlr.handler === 'vide';
+
+    // 1. Fix tkhd.duration (expressed in MOVIE timescale)
+    if (trak.tkhd) {
+      trak.tkhd.set('duration', targetMovieDuration);
+    }
+
+    // 2. Fix mdhd.duration (expressed in TRACK timescale)
+    if (trak.mdia?.mdhd) {
+      const trackTimescale = trak.mdia.mdhd.timescale;
+      const trackDurationSec = isVideo ? videoDurationSec : audioDurationSec;
+      trak.mdia.mdhd.set('duration', Math.round(trackDurationSec * trackTimescale));
+    }
+  });
+
   const buffer = file.getBuffer();
   return new Uint8Array(buffer.slice(0));
 }
