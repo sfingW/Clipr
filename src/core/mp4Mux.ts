@@ -224,15 +224,26 @@ export function muxToMp4(input: MuxInput): Uint8Array {
   let audio: MuxAudioTrack | undefined;
   if (input.audio && input.audio.samples.length > 0) {
     const limit = Math.floor(videoSpanSec * input.audio.timescale); // audio units
+    const before = input.audio.samples.length;
     const kept = input.audio.samples.filter((s) => Math.round(s.dts) < limit);
+    let trimmedUnits = 0;
     if (kept.length > 0) {
-      const samples = kept.map((s, i) =>
-        i === kept.length - 1
-          ? { ...s, duration: Math.max(1, Math.min(s.duration, limit - Math.round(s.dts))) }
-          : s,
-      );
+      const last = kept[kept.length - 1];
+      const cappedDur = Math.max(1, Math.min(last.duration, limit - Math.round(last.dts)));
+      trimmedUnits = last.duration - cappedDur;
+      const samples = kept.map((s, i) => (i === kept.length - 1 ? { ...s, duration: cappedDur } : s));
       audio = { ...input.audio, samples };
     }
+    // Diagnostic (requested): prove whether the video-master cap actually
+    // drops / truncates audio past the video span.
+    console.warn('AUDIO_CAP:', {
+      before,
+      after: kept.length,
+      droppedSamples: before - kept.length,
+      trimmedUnits,
+      limitUnits: limit,
+      videoSpanSec,
+    });
   }
 
   const file = MP4Box.createFile();
@@ -312,6 +323,19 @@ export function muxToMp4(input: MuxInput): Uint8Array {
     // way: mvhd.duration = video track duration, exactly (master clock).
   }
   file.moov?.mvhd?.set?.('duration', videoMovieDur);
+
+  // Diagnostic (requested): the exact durations written into the file,
+  // logged right before getBuffer() freezes them.
+  const lastVideoSample = video.samples[video.samples.length - 1];
+  const lastAudioSample = audio && audio.samples.length > 0 ? audio.samples[audio.samples.length - 1] : null;
+  console.warn('MUX_DIAGNOSTICS:', {
+    videoDurationSec: lastVideoSample.cts / video.timescale,
+    audioDurationSec: audio && lastAudioSample ? lastAudioSample.cts / audio.timescale : 0,
+    videoTimescale: video.timescale,
+    audioTimescale: audio ? audio.timescale : 0,
+    movieDuration: file.moov?.mvhd?.duration,
+    movieTimescale: file.moov?.mvhd?.timescale ?? movieTimescale,
+  });
 
   const buffer = file.getBuffer();
   return new Uint8Array(buffer.slice(0));
