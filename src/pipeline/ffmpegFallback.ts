@@ -212,31 +212,35 @@ export async function renderClipViaFfmpeg(
     if (fatal) throw fatal;
     if (frameIdx === 0) throw new Error('fallback: no frames decoded');
 
+    // pcmData/sampleRate/channels stay in scope through exec() so the
+    // AUDIO_LENGTH_SEC diagnostic below can report the exact WAV length.
+    let pcmData = new Float32Array(0);
+    const sampleRate = audioRate || 48000;
+    const channels = audioChannels || 2;
     let wroteWav = false;
     if (pcmChunks.length > 0) {
       let total = 0;
       for (const chunk of pcmChunks) total += chunk.length;
-      const joined = new Float32Array(total);
+      pcmData = new Float32Array(total);
       let off = 0;
       for (const chunk of pcmChunks) {
-        joined.set(chunk, off);
+        pcmData.set(chunk, off);
         off += chunk.length;
       }
       pcmChunks.length = 0;
-      // Hard-trim the PCM to exactly the cut length: packet selection can
-      // over-collect when source metadata lies, and this WAV's length flows
-      // straight into the container (there is no muxToMp4 cap on this path).
-      const rate = audioRate || 48000;
-      const ch = audioChannels || 2;
-      const keep = Math.max(1, Math.floor(cutSec * rate)) * ch;
-      const pcm = joined.length > keep ? joined.slice(0, keep) : joined;
-      await ffmpeg.writeFile('a.wav', wavFromFloat32(pcm, rate, ch));
+      // Force the PCM to exactly cutSec: the WAV is physically only cutSec
+      // long on disk, whatever the (poisoned-timestamp) extraction collected.
+      const requiredSamples = Math.floor(cutSec * sampleRate) * channels;
+      if (pcmData.length > requiredSamples) {
+        pcmData = pcmData.slice(0, requiredSamples);
+      }
+      await ffmpeg.writeFile('a.wav', wavFromFloat32(pcmData, sampleRate, channels));
       wroteWav = true;
     }
 
     onProgress({ pct: 82, note: 'ffmpeg encode' });
     const outFps = frameIdx > 0 && cutSec > 0 ? frameIdx / cutSec : fps;
-    const code = await ffmpeg.exec([
+    const args = [
       '-framerate',
       outFps.toFixed(6),
       '-i',
@@ -257,8 +261,14 @@ export async function renderClipViaFfmpeg(
       cutSec.toFixed(3),
       '-movflags',
       '+faststart',
+      // Physically prevents encoding more frames than were extracted.
+      '-frames:v',
+      String(frameIdx),
       'out.mp4',
-    ]);
+    ];
+    console.warn('FFMPEG_FINAL_ARGS:', JSON.stringify(args));
+    console.warn('AUDIO_LENGTH_SEC:', pcmData.length / sampleRate / channels);
+    const code = await ffmpeg.exec(args);
     if (code !== 0) throw new Error(`ffmpeg exec failed (code ${code})`);
     const out = (await ffmpeg.readFile('out.mp4')) as Uint8Array;
     onProgress({ pct: 100, note: 'done' });
