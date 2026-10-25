@@ -74,8 +74,13 @@ export interface LlmWorker {
 }
 
 export interface VisionWorker {
+  /**
+   * Face detection over [start, end] (absolute source seconds). Frames arrive as
+   * `videoBatch` stream messages relayed from the demux worker, with acks, the
+   * same as render. The worker registers its stream listener before any await.
+   */
   'vision.track': {
-    payload: { sourcePath: string; start: number; end: number };
+    payload: { start: number; end: number };
     result: FaceSample[];
   };
 }

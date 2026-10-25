@@ -256,9 +256,12 @@ async function ensureEncoders(st: RenderState): Promise<void> {
 async function processVideoBatch(st: RenderState, frames: VideoFrame[]): Promise<void> {
   try {
     await ensureEncoders(st);
-    const { sx, sy, sw, sh, outW, outH } = st.layout;
     const durUs = Math.round(1_000_000 / Math.max(1, st.fps));
     for (const frame of frames) {
+      // Crop per frame: the active keyframe at this frame's clip-relative time
+      // (SPEC §8.8). Output size is the same for every keyframe.
+      const rel = Math.max(0, frame.timestamp / 1e6 - st.spec.sourceStartSec);
+      const { sx, sy, sw, sh, outW, outH } = computeLayout(st.spec, st.source, rel);
       const g = frame.displayWidth / Math.max(1, frame.codedWidth);
       const offscreen = new OffscreenCanvas(outW, outH);
       const ctx2d = offscreen.getContext('2d', { alpha: false });

@@ -115,26 +115,71 @@ function capWords(text: string, max: number): string {
  * 1–10 and rounded; reason is capped at 12 words. Returns null when no score
  * can be found at all.
  */
-export function parseScore(raw: string): ParsedScore | null {
-  const first = raw.indexOf('{');
-  const last = raw.lastIndexOf('}');
-  if (first !== -1 && last > first) {
+/**
+ * Remove markdown fences and inline backticks, e.g. "```json" and "```", which
+ * the small model adds around its JSON.
+ */
+export function stripMarkdown(raw: string): string {
+  return raw.replace(/```[a-zA-Z0-9_-]*/g, '').replace(/`/g, '');
+}
+
+/** A score value as a number: 7, "7", "7/10", "7 out of 10". Null when there is no digit. */
+function toScoreNumber(v: unknown): number | null {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string') {
+    const m = /-?\d+(?:\.\d+)?/.exec(v);
+    return m ? Number(m[0]) : null;
+  }
+  return null;
+}
+
+/** Light JSON repairs for near-JSON: trailing commas, single-quoted strings. */
+function repairJson(body: string): string {
+  let out = body.replace(/,\s*([}\]])/g, '$1');
+  if (!out.includes('"')) out = out.replace(/'/g, '"');
+  return out;
+}
+
+function fromObject(text: string): ParsedScore | null {
+  const first = text.indexOf('{');
+  if (first === -1) return null;
+  const last = text.lastIndexOf('}');
+  // A reply cut off by the token limit has no closing brace: close it.
+  const body = last > first ? text.slice(first, last + 1) : `${text.slice(first)}}`;
+  for (const candidate of [body, repairJson(body)]) {
     try {
-      const obj = JSON.parse(raw.slice(first, last + 1)) as { score?: unknown; reason?: unknown };
-      const n = typeof obj.score === 'string' ? Number(obj.score) : obj.score;
-      if (typeof n === 'number' && Number.isFinite(n)) {
+      const obj = JSON.parse(candidate) as Record<string, unknown>;
+      const n = toScoreNumber(obj.score ?? obj.Score ?? obj.rating);
+      if (n !== null) {
+        const reason = obj.reason ?? obj.Reason;
         return {
           score: clampScore(n),
-          reason: typeof obj.reason === 'string' ? capWords(obj.reason, MAX_REASON_WORDS) : '',
+          reason: typeof reason === 'string' ? capWords(reason, MAX_REASON_WORDS) : '',
         };
       }
     } catch {
-      // fall through to the pattern fallback
+      // not valid JSON even after repair: try the next form
     }
   }
-  const m = /"?score"?\s*[:=]\s*"?(-?\d+(?:\.\d+)?)/i.exec(raw);
+  return null;
+}
+
+/**
+ * Read a score from a model reply (SPEC §8.6). Tries, in order: the JSON object
+ * between the first "{" and the last "}" (after markdown is stripped), the same
+ * with light repairs, then key/value and "N/10" patterns. Returns null only when
+ * no score number can be found at all.
+ */
+export function parseScore(raw: string): ParsedScore | null {
+  const text = stripMarkdown(raw);
+  const fromJson = fromObject(text);
+  if (fromJson) return fromJson;
+
+  const m =
+    /["']?(?:score|rating)["']?\s*[:=]\s*["']?(-?\d+(?:\.\d+)?)/i.exec(text) ??
+    /(-?\d+(?:\.\d+)?)\s*(?:\/|out of)\s*10\b/i.exec(text);
   if (m) {
-    const reasonMatch = /"?reason"?\s*[:=]\s*"([^"]*)"/i.exec(raw);
+    const reasonMatch = /["']?reason["']?\s*[:=]\s*["']([^"']*)/i.exec(text);
     return {
       score: clampScore(Number(m[1])),
       reason: reasonMatch ? capWords(reasonMatch[1], MAX_REASON_WORDS) : '',
@@ -166,6 +211,7 @@ export async function scoreWithRetry(
 ): Promise<ScoreResult> {
   const prompt = buildScoringPrompt(text);
   const timeoutMs = opts.timeoutMs ?? WINDOW_TIMEOUT_MS;
+  let lastRaw = '';
   for (const temperature of [SCORE_TEMPERATURE, RETRY_TEMPERATURE]) {
     let raw: string;
     try {
@@ -176,9 +222,12 @@ export async function scoreWithRetry(
       }
       throw err;
     }
+    lastRaw = raw;
     const parsed = parseScore(raw);
     if (parsed) return { ...parsed, parsed: true };
   }
+  // Logged so the real model output can be read when scores look wrong.
+  console.warn('[clipr] unreadable AI reply:', lastRaw.slice(0, 200));
   return { score: DEFAULT_SCORE, reason: 'Model reply unreadable; default score.', parsed: false };
 }
 

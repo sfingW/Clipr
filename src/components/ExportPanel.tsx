@@ -4,8 +4,10 @@
  * render pipeline runs, `error` for §20 states, and the completed-blob URL
  * handed down by App after a successful export.
  */
+import { useState } from 'react';
 import { useAppStore } from '../app/store';
 import type { ClipSpec, SourceMeta } from '../core/types';
+import { runAutoReframe } from '../pipeline/reframeRun';
 
 export interface ExportPanelProps {
   source: SourceMeta;
@@ -36,10 +38,33 @@ export default function ExportPanel({
   const setError = useAppStore((s) => s.setError);
   const setFormat = useAppStore((s) => s.setFormat);
   const setExportPreset = useAppStore((s) => s.setExportPreset);
+  const setCrop = useAppStore((s) => s.setCrop);
+  const [reframing, setReframing] = useState(false);
+  const [reframeNote, setReframeNote] = useState<string | null>(null);
 
   const cutLen = clip.sourceEndSec - clip.sourceStartSec;
   const cutValid = cutLen >= 0.2 && clip.sourceEndSec <= source.durationSec + 0.001;
   const rendering = progress !== null && progress.stage === 'rendering';
+
+  /** Face-track the clip (SPEC §8.8) and switch to a vertical crop. */
+  const onAutoReframe = async (): Promise<void> => {
+    const clipId = clip.id;
+    setReframing(true);
+    setReframeNote(null);
+    const out = await runAutoReframe(clip, source);
+    // Apply only if the same clip is still active when the analysis finishes.
+    if (useAppStore.getState().activeClipId === clipId) {
+      setCrop(out.crop);
+      setFormat('vertical');
+    }
+    const positions = new Set(out.crop.map((k) => k.x)).size;
+    setReframeNote(
+      out.crop.length > 0
+        ? `Auto-reframe: following the speaker across ${positions} crop position${positions === 1 ? '' : 's'}.`
+        : (out.note ?? 'Auto-reframe: center crop.'),
+    );
+    setReframing(false);
+  };
 
   return (
     <section className="export" aria-label="Export">
@@ -89,10 +114,19 @@ export default function ExportPanel({
 
       <p className="export__note">
         Captions come from the transcript and are drawn the same way in the preview and the
-        export. Speaker tracking arrives in a later phase (see SPEC §21).
+        export. Auto-Reframe follows the speaker in the vertical crop; with no face found, the
+        crop is centered.
       </p>
 
       <div className="export__actions">
+        <button
+          type="button"
+          className="btn btn--ghost"
+          onClick={() => void onAutoReframe()}
+          disabled={busy || reframing || rendering || !cutValid}
+        >
+          {reframing ? 'Tracking faces…' : 'Auto-Reframe'}
+        </button>
         <button
           type="button"
           className="btn btn--primary"
@@ -111,6 +145,12 @@ export default function ExportPanel({
           </a>
         ) : null}
       </div>
+
+      {reframeNote ? (
+        <p className="export__note" role="status">
+          {reframeNote}
+        </p>
+      ) : null}
 
       {rendering && progress ? (
         <div

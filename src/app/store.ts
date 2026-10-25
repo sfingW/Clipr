@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Candidate, ClipSpec, SourceMeta, Transcript } from '../core/types';
+import type { Candidate, ClipSpec, CropKeyframe, SourceMeta, Transcript } from '../core/types';
 import { canTransition, type JobState } from '../core/jobMachine';
 import type { Tier } from './tiers';
 
@@ -93,6 +93,8 @@ export interface AppStore {
   /** Frame-accurate in/out for the active clip (SPEC §8.6). */
   setCut: (startSec: number, endSec: number) => void;
   setFormat: (format: ClipSpec['format']) => void;
+  /** Auto-reframe result for the active clip (SPEC §8.8). Empty = center crop. */
+  setCrop: (crop: CropKeyframe[]) => void;
   setTranscript: (transcript: Transcript | null) => void;
   setCandidates: (candidates: Candidate[]) => void;
   setClips: (clips: ClipSpec[]) => void;
@@ -153,6 +155,10 @@ export const useAppStore = create<AppStore>()((set) => ({
   setFormat: (format) =>
     set((s) => ({
       clips: s.clips.map((c) => (c.id === s.activeClipId ? { ...c, format } : c)),
+    })),
+  setCrop: (crop) =>
+    set((s) => ({
+      clips: s.clips.map((c) => (c.id === s.activeClipId ? { ...c, crop } : c)),
     })),
   setTranscript: (transcript) => set({ transcript }),
   setCandidates: (candidates) => set({ candidates }),

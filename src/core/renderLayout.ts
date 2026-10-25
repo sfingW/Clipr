@@ -20,13 +20,33 @@ export function align2(n: number): number {
   return Math.max(2, n & ~1);
 }
 
-export function computeLayout(spec: ClipSpec, source: SourceMeta): OutputLayout {
+/**
+ * The crop keyframe active at clip-relative time `tRel`. Step lookup: a crop
+ * holds until the next keyframe, so framing switches between discrete positions
+ * (SPEC §8.8). Before the first keyframe, the first one applies.
+ */
+export function cropAt(crop: ClipSpec['crop'], tRel: number): ClipSpec['crop'][number] | undefined {
+  if (crop.length === 0) return undefined;
+  let active = crop[0];
+  for (const k of crop) {
+    if (k.t <= tRel) active = k;
+    else break;
+  }
+  return active;
+}
+
+/**
+ * Output layout for a clip. `tRel` is clip-relative seconds and selects the crop
+ * keyframe; the default 0 gives the first keyframe (or a center crop). Preview
+ * and export both call this, so they always agree (SPEC §8.9).
+ */
+export function computeLayout(spec: ClipSpec, source: SourceMeta, tRel = 0): OutputLayout {
   let sx = 0;
   let sy = 0;
   let sw = source.width;
   let sh = source.height;
 
-  const key = spec.crop[0];
+  const key = cropAt(spec.crop, tRel);
   if (key && key.width > 0) {
     sx = Math.round(key.x);
     sw = Math.round(key.width);
