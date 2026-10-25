@@ -46,6 +46,10 @@ function loadDetector(): Promise<FaceDetector> {
     console.log('[clipr] Initializing MediaPipe WASM from:', WASM_PATH);
     try {
       const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+      console.log(
+        '[clipr] FilesetResolver loaded. globalThis.ModuleFactory is:',
+        typeof (globalThis as { ModuleFactory?: unknown }).ModuleFactory,
+      );
       return await FaceDetector.createFromOptions(fileset, {
         baseOptions: {
           modelAssetPath: MODEL_PATH,
