@@ -68,6 +68,11 @@ function splitOversizedWasmAssets(): Plugin {
 
 export default defineConfig({
   plugins: [react(), splitOversizedWasmAssets()],
+  // Classic (IIFE) workers: MediaPipe's loader expects importScripts()-style
+  // globals, which module workers do not provide.
+  worker: {
+    format: 'iife',
+  },
   resolve: {
     alias: [
       // Transformers.js imports the WebGPU ONNX Runtime build, which bundles the
