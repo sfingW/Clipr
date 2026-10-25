@@ -146,7 +146,11 @@ export async function renderClipViaFfmpeg(
   let fatal: Error | null = null;
 
   const captureFrame = async (frame: VideoFrame): Promise<void> => {
-    ctx.drawImage(frame, layout.sx, layout.sy, layout.sw, layout.sh, 0, 0, layout.outW, layout.outH);
+    // Same per-frame crop as render.worker (SPEC §8.8): the keyframe active at
+    // this frame's clip-relative time. The output size does not change.
+    const rel = Math.max(0, frame.timestamp / 1e6 - spec.sourceStartSec);
+    const lay = computeLayout(spec, source, rel);
+    ctx.drawImage(frame, lay.sx, lay.sy, lay.sw, lay.sh, 0, 0, lay.outW, lay.outH);
     // Same caption call as render.worker (SPEC §8.9); frame pts is absolute.
     if (words.length > 0) {
       drawClipCaptions(

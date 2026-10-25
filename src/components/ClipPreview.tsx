@@ -53,7 +53,9 @@ export default function ClipPreview({ source, clip, onCut }: ClipPreviewProps) {
 
   const inSec = clip.sourceStartSec;
   const outSec = clip.sourceEndSec;
-  const layout = computeLayout(clip, source);
+  // The crop shown is the one active at the scrub position (SPEC §8.8), from
+  // the same layout function the export uses.
+  const layout = computeLayout(clip, source, Math.max(0, scrubSec - inSec));
 
   const drawOverlay = useCallback(
     (tAbsSec: number | null): void => {

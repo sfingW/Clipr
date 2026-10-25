@@ -8,7 +8,30 @@ import {
   type DemuxWorker,
   type RenderWorker,
   type RpcClient,
+  type VisionWorker,
 } from '../core/rpc';
+
+let vision: RpcClient<VisionWorker> | null = null;
+
+/**
+ * Vision worker (SPEC §8.8). A crash drops the singleton, so the next
+ * Auto-Reframe starts a fresh worker. Like ASR, the crashed one may be broken.
+ */
+export function getVisionClient(): RpcClient<VisionWorker> {
+  if (!vision) {
+    const worker = new Worker(new URL('../workers/vision.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    const client: RpcClient<VisionWorker> = createRpcClient<VisionWorker>(worker, {
+      onCrash: () => {
+        worker.terminate();
+        if (vision === client) vision = null;
+      },
+    });
+    vision = client;
+  }
+  return vision;
+}
 
 let demux: RpcClient<DemuxWorker> | null = null;
 let render: RpcClient<RenderWorker> | null = null;
