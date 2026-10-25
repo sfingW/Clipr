@@ -78,6 +78,7 @@ const SegmentView = memo(function SegmentView({ words, group, activeIdx, onSeek 
 export default function TranscriptPane() {
   const transcript = useAppStore((s) => s.transcript);
   const asr = useAppStore((s) => s.asr);
+  const reframeBusy = useAppStore((s) => s.reframeBusy);
   const playheadSec = useAppStore((s) => s.playheadSec);
   const setPlayhead = useAppStore((s) => s.setPlayhead);
 
@@ -100,6 +101,12 @@ export default function TranscriptPane() {
         <div className="transcript__loading" role="status">
           <span>{statusLine(asr)}</span>
           <progress className="transcript__progress" max={100} value={Math.round(asr.pct)} />
+        </div>
+      ) : null}
+
+      {reframeBusy ? (
+        <div className="transcript__notice" role="status">
+          Auto-Reframe is tracking faces on the active clip. Transcription runs independently.
         </div>
       ) : null}
 

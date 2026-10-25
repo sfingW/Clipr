@@ -91,6 +91,9 @@ async function track(ctx: RpcServerContext): Promise<VisionMethods['vision.track
     ctx.sendStream({ kind: 'ack', batchId: batch.batchId });
   };
 
+  // The demux sends `end` after its last batch. It can arrive without a `last`
+  // batch, when the final batch was already sent, so it also ends the loop.
+  let ended = false;
   const offStream = ctx.onStream((msg) => {
     if (msg.kind === 'videoBatch') {
       if (finished) closeAndAck(msg);
@@ -98,6 +101,9 @@ async function track(ctx: RpcServerContext): Promise<VisionMethods['vision.track
         batches.push(msg);
         notify();
       }
+    } else if (msg.kind === 'end') {
+      ended = true;
+      notify();
     } else if (msg.kind === 'abort') {
       aborted = true;
       notify();
@@ -164,6 +170,7 @@ async function track(ctx: RpcServerContext): Promise<VisionMethods['vision.track
     while (!done && !aborted) {
       const batch = batches.shift();
       if (!batch) {
+        if (ended) break;
         await new Promise<void>((resolve) => {
           wake = resolve;
         });

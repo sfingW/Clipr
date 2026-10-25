@@ -9,6 +9,9 @@ import { useAppStore } from '../app/store';
 import type { ClipSpec, SourceMeta } from '../core/types';
 import { runAutoReframe } from '../pipeline/reframeRun';
 
+/** Auto-Reframe tracks slower on long ranges; ask before starting above this. */
+export const REFRAME_LONG_SEC = 60;
+
 export interface ExportPanelProps {
   source: SourceMeta;
   clip: ClipSpec;
@@ -41,29 +44,45 @@ export default function ExportPanel({
   const setCrop = useAppStore((s) => s.setCrop);
   const [reframing, setReframing] = useState(false);
   const [reframeNote, setReframeNote] = useState<string | null>(null);
+  const [confirmLong, setConfirmLong] = useState(false);
+  const setReframeBusy = useAppStore((s) => s.setReframeBusy);
+  const asrBusy = useAppStore((s) => s.asr.phase === 'loading' || s.asr.phase === 'running');
 
   const cutLen = clip.sourceEndSec - clip.sourceStartSec;
   const cutValid = cutLen >= 0.2 && clip.sourceEndSec <= source.durationSec + 0.001;
   const rendering = progress !== null && progress.stage === 'rendering';
+  const longClip = cutLen > REFRAME_LONG_SEC;
 
-  /** Face-track the clip (SPEC §8.8) and switch to a vertical crop. */
-  const onAutoReframe = async (): Promise<void> => {
+  /** Face-track the active In/Out range (SPEC §8.8) and switch to a vertical crop. */
+  const runReframe = async (): Promise<void> => {
     const clipId = clip.id;
+    setConfirmLong(false);
     setReframing(true);
+    setReframeBusy(true);
     setReframeNote(null);
-    const out = await runAutoReframe(clip, source);
-    // Apply only if the same clip is still active when the analysis finishes.
-    if (useAppStore.getState().activeClipId === clipId) {
-      setCrop(out.crop);
-      setFormat('vertical');
+    try {
+      const out = await runAutoReframe(clip, source);
+      // Apply only if the same clip is still active when the analysis finishes.
+      if (useAppStore.getState().activeClipId === clipId) {
+        setCrop(out.crop);
+        setFormat('vertical');
+      }
+      const positions = new Set(out.crop.map((k) => k.x)).size;
+      setReframeNote(
+        out.crop.length > 0
+          ? `Auto-reframe: following the speaker across ${positions} crop position${positions === 1 ? '' : 's'}.`
+          : (out.note ?? 'Auto-reframe: center crop.'),
+      );
+    } finally {
+      setReframing(false);
+      setReframeBusy(false);
     }
-    const positions = new Set(out.crop.map((k) => k.x)).size;
-    setReframeNote(
-      out.crop.length > 0
-        ? `Auto-reframe: following the speaker across ${positions} crop position${positions === 1 ? '' : 's'}.`
-        : (out.note ?? 'Auto-reframe: center crop.'),
-    );
-    setReframing(false);
+  };
+
+  /** Clips over the limit need an explicit confirmation before tracking starts. */
+  const onAutoReframeClick = (): void => {
+    if (longClip) setConfirmLong(true);
+    else void runReframe();
   };
 
   return (
@@ -122,8 +141,9 @@ export default function ExportPanel({
         <button
           type="button"
           className="btn btn--ghost"
-          onClick={() => void onAutoReframe()}
-          disabled={busy || reframing || rendering || !cutValid}
+          onClick={onAutoReframeClick}
+          disabled={busy || reframing || rendering || !cutValid || asrBusy || confirmLong}
+          title={asrBusy ? 'Available when transcription finishes' : undefined}
         >
           {reframing ? 'Tracking faces…' : 'Auto-Reframe'}
         </button>
@@ -145,6 +165,26 @@ export default function ExportPanel({
           </a>
         ) : null}
       </div>
+
+      {asrBusy && !reframing ? (
+        <p className="export__note" role="status">
+          Auto-Reframe is available when transcription finishes.
+        </p>
+      ) : null}
+
+      {confirmLong ? (
+        <div className="export__note" role="alertdialog" aria-label="Confirm Auto-Reframe">
+          <p>Auto-Reframe works best on clips under 60s. Processing may take a long time.</p>
+          <div className="export__actions">
+            <button type="button" className="btn btn--primary" onClick={() => void runReframe()}>
+              Track anyway
+            </button>
+            <button type="button" className="btn btn--ghost" onClick={() => setConfirmLong(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       {reframeNote ? (
         <p className="export__note" role="status">
