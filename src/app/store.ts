@@ -41,6 +41,8 @@ export type LlmPhase = 'idle' | 'loading' | 'scoring' | 'ready' | 'failed';
 
 export interface LlmStatus {
   phase: LlmPhase;
+  /** Which engine is in use: WebGPU, or CPU after a GPU failure (or no WebGPU). */
+  engine: 'webgpu' | 'cpu' | null;
   /** 0–100 within the current phase (model download, or scoring). */
   pct: number;
   note: string | null;
@@ -50,7 +52,7 @@ export interface LlmStatus {
   total?: number;
 }
 
-export const INITIAL_LLM: LlmStatus = { phase: 'idle', pct: 0, note: null, error: null };
+export const INITIAL_LLM: LlmStatus = { phase: 'idle', engine: null, pct: 0, note: null, error: null };
 
 /**
  * Store shape: job state + UI state (SPEC §6).

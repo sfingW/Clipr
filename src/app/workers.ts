@@ -6,7 +6,6 @@ import {
   createRpcClient,
   type AsrWorker,
   type DemuxWorker,
-  type LlmWorker,
   type RenderWorker,
   type RpcClient,
 } from '../core/rpc';
@@ -14,7 +13,6 @@ import {
 let demux: RpcClient<DemuxWorker> | null = null;
 let render: RpcClient<RenderWorker> | null = null;
 let asr: RpcClient<AsrWorker> | null = null;
-let llm: RpcClient<LlmWorker> | null = null;
 
 export function getDemuxClient(): RpcClient<DemuxWorker> {
   if (!demux) {
@@ -54,24 +52,4 @@ export function getAsrClient(): RpcClient<AsrWorker> {
     asr = client;
   }
   return asr;
-}
-
-/**
- * LLM worker (Phase 4). Like ASR: a crash terminates it and drops the
- * singleton, so the next "Find Best Clips" starts a fresh engine.
- */
-export function getLlmClient(): RpcClient<LlmWorker> {
-  if (!llm) {
-    const worker = new Worker(new URL('../workers/llm.worker.ts', import.meta.url), {
-      type: 'module',
-    });
-    const client: RpcClient<LlmWorker> = createRpcClient<LlmWorker>(worker, {
-      onCrash: () => {
-        worker.terminate();
-        if (llm === client) llm = null;
-      },
-    });
-    llm = client;
-  }
-  return llm;
 }

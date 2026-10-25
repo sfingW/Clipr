@@ -1,17 +1,16 @@
 /**
  * Ranked clip candidates (SPEC §8.6, Phase 4).
  *
- * Shows the "Find Best Clips" action (only when WebGPU is available and a
- * transcript exists), the model/scoring progress, and the candidate list sorted
- * best-first. Clicking a candidate sets the clip's In/Out to its window and
- * moves the playhead there, so the preview shows it straight away.
+ * Shows the "Find Best Clips" action (whenever a transcript exists), the
+ * model/scoring progress, and the candidate list sorted best-first. Clicking a
+ * candidate sets the clip's In/Out to its window and moves the playhead there.
  *
- * Without WebGPU the AI controls are hidden and a notice explains why; the
- * manual cutter is unaffected.
+ * AI runs on WebGPU when available, and on CPU otherwise or after a GPU
+ * failure. The UI shows which engine is in use. The manual cutter is unaffected.
  */
-import { getLlmClient } from '../app/workers';
+import { getLlmDeps } from '../workers/llmClient';
 import { useAppStore } from '../app/store';
-import { runScoring, defaultScoringDeps } from '../pipeline/scoring';
+import { runScoring } from '../pipeline/scoring';
 import type { Candidate } from '../core/types';
 
 const SNIPPET_WORDS = 18;
@@ -70,23 +69,12 @@ export default function CandidateList() {
 
   if (!source) return null;
 
-  if (webgpu === 'unavailable') {
-    return (
-      <section className="candidates" aria-label="Clip candidates">
-        <h2 className="candidates__title">Best clips</h2>
-        <p className="candidates__notice" role="status">
-          AI highlight scoring is unavailable: this browser has no WebGPU support. You can still cut manually.
-        </p>
-      </section>
-    );
-  }
-
   const scoring = jobState === 'llm_loading' || jobState === 'scoring';
-  const canFind = webgpu === 'available' && transcript !== null && (jobState === 'ready' || jobState === 'candidates_ready');
+  const canFind = transcript !== null && (jobState === 'ready' || jobState === 'candidates_ready');
 
   const onFind = (): void => {
     if (!source) return;
-    void runScoring(source, defaultScoringDeps(getLlmClient));
+    void runScoring(source, getLlmDeps(webgpu !== 'unavailable'));
   };
 
   return (
@@ -100,12 +88,24 @@ export default function CandidateList() {
         ) : null}
       </header>
 
+      {webgpu === 'unavailable' ? (
+        <p className="candidates__notice" role="status">
+          This browser has no WebGPU, so AI scoring will run on CPU (slower).
+        </p>
+      ) : null}
+
+      {llm.engine === 'cpu' && (scoring || llm.phase === 'loading' || llm.phase === 'ready') ? (
+        <p className="candidates__notice" role="status">
+          AI engine: CPU (WASM).
+        </p>
+      ) : null}
+
       {scoring || llm.phase === 'loading' ? (
         <div className="candidates__progress" role="status">
           <span>
             {llm.phase === 'scoring' && llm.total !== undefined
               ? `Scoring clips ${llm.done ?? 0}/${llm.total}…`
-              : `${llm.note ?? 'Loading AI model'}… ${Math.round(llm.pct)}%`}
+              : `${llm.note ?? 'Loading AI model…'} ${Math.round(llm.pct)}%`}
           </span>
           <progress className="candidates__bar" max={100} value={Math.round(llm.pct)} />
         </div>
@@ -125,7 +125,7 @@ export default function CandidateList() {
         </ol>
       ) : llm.phase === 'ready' || llm.phase === 'failed' ? (
         <p className="candidates__empty">No candidate windows were found in this transcript.</p>
-      ) : !scoring && webgpu === 'available' && transcript === null ? (
+      ) : !scoring && transcript === null ? (
         <p className="candidates__empty">Candidates appear once the transcript is ready.</p>
       ) : null}
     </section>
