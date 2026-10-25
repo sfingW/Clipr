@@ -57,7 +57,12 @@ let videoDecoder: VideoDecoder | null = null;
 let decodeError: Error | null = null;
 let collector: ((frame: VideoFrame) => void) | null = null;
 
-/** Serializes all decode work — one VideoDecoder cannot interleave streams. */
+/**
+ * Serializes the shared reader and decode calls. Waits for acks happen outside
+ * the lock, so a long stream never holds it between batches (other requests
+ * such as audio extraction run in between). Each stream decodes on its own
+ * VideoDecoder, so no other request can change its GOP state.
+ */
 let decodeLock: Promise<unknown> = Promise.resolve();
 function withDecodeLock<T>(fn: () => Promise<T>): Promise<T> {
   const run = decodeLock.then(fn, fn);
@@ -91,20 +96,15 @@ function tagged(code: string, err: unknown): Error {
   return new Error(msg.startsWith(`${code}:`) ? msg : `${code}: ${msg}`);
 }
 
-function ensureVideoDecoder(): VideoDecoder {
-  if (decodeError) {
-    const err = tagged('WEB_CODECS_VIDEO_UNSUPPORTED', decodeError);
-    decodeError = null;
-    throw err;
-  }
-  if (videoDecoder && videoDecoder.state !== 'closed') return videoDecoder;
-  const dec = new VideoDecoder({
-    output: (frame) => {
-      if (collector) collector(frame);
-      else frame.close();
-    },
+/**
+ * A configured AVC VideoDecoder. Output and error go to the callbacks given, so
+ * a caller owns its frames and state. Throws WEB_CODECS_VIDEO_UNSUPPORTED.
+ */
+function newVideoDecoder(onFrame: (frame: VideoFrame) => void, onError: (e: Error) => void): VideoDecoder {
+  const dec: VideoDecoder = new VideoDecoder({
+    output: onFrame,
     error: (e) => {
-      decodeError = e instanceof Error ? e : new Error(String(e));
+      onError(e instanceof Error ? e : new Error(String(e)));
       try {
         if (dec.state !== 'closed') dec.close();
       } catch {
@@ -131,6 +131,26 @@ function ensureVideoDecoder(): VideoDecoder {
     if (dec.state !== 'closed') dec.close();
     throw tagged('WEB_CODECS_VIDEO_UNSUPPORTED', err);
   }
+  return dec;
+}
+
+/** The shared decoder used by frameAt. Its frames go to `collector`. */
+function ensureVideoDecoder(): VideoDecoder {
+  if (decodeError) {
+    const err = tagged('WEB_CODECS_VIDEO_UNSUPPORTED', decodeError);
+    decodeError = null;
+    throw err;
+  }
+  if (videoDecoder && videoDecoder.state !== 'closed') return videoDecoder;
+  const dec = newVideoDecoder(
+    (frame) => {
+      if (collector) collector(frame);
+      else frame.close();
+    },
+    (err) => {
+      decodeError = err;
+    },
+  );
   videoDecoder = dec;
   return dec;
 }
@@ -379,6 +399,7 @@ async function streamPcmAudio(
       throw tagged('AUDIO_DECODER_UNSUPPORTED', err);
     }
     try {
+      await withDecodeLock(async () => {
       for (let k = start; k < end; k++) {
         const i = selected[k];
         const data = await session!.reader(table.offsets[i], table.sizes[i]);
@@ -395,6 +416,7 @@ async function streamPcmAudio(
         );
       }
       await dec.flush();
+      });
       if (decErr) throw decErr;
     } catch (err) {
       if (dec.state !== 'closed') dec.close();
@@ -487,89 +509,84 @@ async function streamClipInner(
   let sent = 0;
   let batchId = 0;
   try {
+    // Audio first. The lock is held only around reads and decodes, never across
+    // an ack wait, so other requests run between batches.
     if (meta.audio.mode === 'remux') {
-      const remux = await buildRemuxAudio(
-        audio!,
-        remuxFramesPerAu,
-        remuxRate,
-        payload.startSec,
-        payload.endSec,
+      const remux = await withDecodeLock(() =>
+        buildRemuxAudio(audio!, remuxFramesPerAu, remuxRate, payload.startSec, payload.endSec),
       );
       if (remux) ctx.sendStream({ kind: 'audioRemux', audio: remux });
     } else if (meta.audio.mode === 'pcm') {
       await streamPcmAudio(audio!, payload.startSec, payload.endSec, ctx, gate);
     }
 
-    const dec = ensureVideoDecoder();
+    // Video decodes on a decoder of its own, not the shared one frameAt uses, so
+    // its GOP state can't be touched by another request while it waits for acks.
     const w = session!.parsed.video!.width ?? 640;
     const h = session!.parsed.video!.height ?? 360;
     const batchSize = Math.max(4, Math.min(24, Math.round(2_000_000 / Math.max(1, w * h))));
-    const out: VideoFrame[] = [];
-    collector = (frame) => {
-      if (frame.timestamp >= startUs - 1000 && frame.timestamp < endUs) out.push(frame);
-      else frame.close();
-    };
     let pending: VideoFrame[] = [];
+    let decodeErr: Error | null = null;
+    const dec = newVideoDecoder(
+      (frame) => {
+        if (frame.timestamp >= startUs - 1000 && frame.timestamp < endUs) pending.push(frame);
+        else frame.close();
+      },
+      (e) => {
+        decodeErr = e;
+      },
+    );
     try {
       // WebCodecs requires a key chunk after configure() *and after every
-      // flush()* — a flush at an arbitrary (mid-GOP) boundary makes the next
-      // delta chunk throw "A key frame is required after configure() or
-      // flush()". So the ONLY flush is the final one below; between now and
-      // then we decode sample-by-sample, drain outputs as they arrive, and
-      // release them in acked batches (the ack gate is the backpressure, and
-      // memory stays bounded to one in-flight batch).
+      // flush()*. So the only flush is the one after the loop, and the first
+      // chunk is always a key. Between samples the decoder keeps its state.
       for (let i = from; i < to; i++) {
-        const data = await readSample(track, i);
-        dec.decode(
-          new EncodedVideoChunk({
-            // First chunk of the window is always typed 'key': `from` is
-            // sync-anchored by sampleRangeForWindow (nearest sync sample at or
-            // before sourceStartSec); force it regardless in case the stss
-            // flags ever disagree, since only the type is checked here.
-            type: i === from || table.sync[i] ? 'key' : 'delta',
-            timestamp: toUs(table.pts[i], timescale),
-            data,
-          }),
-        );
-        for (const frame of out.splice(0, out.length)) {
-          pending.push(frame);
-          sent++;
-        }
+        await withDecodeLock(async () => {
+          const data = await readSample(track, i);
+          if (decodeErr) throw decodeErr;
+          dec.decode(
+            new EncodedVideoChunk({
+              // First chunk of the window is always typed 'key': `from` is
+              // sync-anchored by sampleRangeForWindow; force it regardless.
+              type: i === from || table.sync[i] ? 'key' : 'delta',
+              timestamp: toUs(table.pts[i], timescale),
+              data,
+            }),
+          );
+        });
         while (pending.length >= batchSize) {
-          const frames = pending.slice(0, batchSize);
-          pending = pending.slice(batchSize);
+          const frames = pending.splice(0, batchSize);
+          sent += frames.length;
           const id = batchId++;
           ctx.sendStream({ kind: 'videoBatch', frames, batchId: id, last: false });
           await gate.wait(id);
         }
         if (i % 8 === 0) {
-          ctx.progress(Math.min(95, 30 + (sent / totalSend) * 65), {
+          ctx.progress(Math.min(95, 30 + ((sent + pending.length) / totalSend) * 65), {
             stage: 'rendering',
-            done: sent,
+            done: sent + pending.length,
             total: totalSend,
           });
         }
       }
-      // Single legal flush: drains every remaining output; nothing decodes
-      // after it (the next operation always starts a window with a key chunk).
-      await dec.flush();
-      for (const frame of out.splice(0, out.length)) {
-        pending.push(frame);
-        sent++;
-      }
+      // Single legal flush: drains every remaining output; nothing decodes after it.
+      await withDecodeLock(async () => {
+        await dec.flush();
+        if (decodeErr) throw decodeErr;
+      });
+      sent += pending.length;
       if (pending.length > 0) {
+        const frames = pending.splice(0);
         const id = batchId++;
-        ctx.sendStream({ kind: 'videoBatch', frames: pending, batchId: id, last: true });
+        ctx.sendStream({ kind: 'videoBatch', frames, batchId: id, last: true });
         await gate.wait(id);
-        pending = [];
       }
     } catch (err) {
       throw tagged('WEB_CODECS_VIDEO_UNSUPPORTED', err);
     } finally {
-      collector = null;
       // Close anything we still own (frames not yet handed to a transfer).
-      for (const f of out.splice(0)) f.close();
       for (const f of pending.splice(0)) f.close();
+      if (dec.state !== 'closed') dec.close();
     }
 
     ctx.sendStream({ kind: 'end' });
@@ -723,7 +740,8 @@ serveRpc<DemuxMethods>(
   {
     'demux.open': (payload) => withDecodeLock(() => open(payload)),
     'demux.frameAt': (payload) => withDecodeLock(() => frameAtInner(payload)),
-    'demux.streamClip': (payload, ctx) => withDecodeLock(() => streamClipInner(payload, ctx)),
+    // Not wrapped in withDecodeLock: the lock is taken per operation inside.
+    'demux.streamClip': (payload, ctx) => streamClipInner(payload, ctx),
     'demux.close': () => withDecodeLock(() => close()),
     // Not wrapped in withDecodeLock: each batch takes the lock itself.
     'demux.extractAudio': (payload, ctx) => extractAudioInner(payload, ctx),

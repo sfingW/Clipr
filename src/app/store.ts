@@ -72,6 +72,8 @@ export interface AppStore {
   asr: AsrStatus;
   llm: LlmStatus;
   webgpu: WebGpuStatus;
+  /** True while Auto-Reframe face-tracks the active clip (informational). */
+  reframeBusy: boolean;
 
   // ui state
   /** Shared playhead in source seconds: scrub position, and what the transcript highlights. */
@@ -104,6 +106,7 @@ export interface AppStore {
   setAsr: (patch: Partial<AsrStatus>) => void;
   setLlm: (patch: Partial<LlmStatus>) => void;
   setWebGpu: (status: WebGpuStatus) => void;
+  setReframeBusy: (busy: boolean) => void;
 
   // ui actions
   setPlayhead: (sec: number) => void;
@@ -125,6 +128,7 @@ export const useAppStore = create<AppStore>()((set) => ({
   asr: INITIAL_ASR,
   llm: INITIAL_LLM,
   webgpu: 'unknown',
+  reframeBusy: false,
 
   playheadSec: 0,
   selectedCandidateId: null,
@@ -169,6 +173,7 @@ export const useAppStore = create<AppStore>()((set) => ({
   setAsr: (patch) => set((s) => ({ asr: { ...s.asr, ...patch } })),
   setLlm: (patch) => set((s) => ({ llm: { ...s.llm, ...patch } })),
   setWebGpu: (webgpu) => set({ webgpu }),
+  setReframeBusy: (reframeBusy) => set({ reframeBusy }),
 
   setPlayhead: (playheadSec) => set({ playheadSec: Math.max(0, playheadSec) }),
   selectCandidate: (selectedCandidateId) => set({ selectedCandidateId }),
