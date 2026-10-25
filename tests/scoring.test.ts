@@ -9,8 +9,12 @@ import type { JobState } from '../src/core/jobMachine';
 import type { Candidate, SourceMeta, Transcript, Word } from '../src/core/types';
 import {
   DEFAULT_SCORE,
+  LLM_CONTEXT_WINDOW,
   MAX_REASON_WORDS,
   TOP_N,
+  WINDOW_TIMEOUT_MS,
+  ScoreTimeoutError,
+  withTimeout,
   buildScoringPrompt,
   describeLlmError,
   parseScore,
@@ -354,5 +358,75 @@ describe('describeLlmError', () => {
     expect(describeLlmError(new Error('Failed to fetch'))).toMatch(/download/);
     expect(describeLlmError(new Error('something odd'))).toBe('AI scoring failed. Showing unscored clips.');
     expect(describeLlmError('plain string')).toBe('AI scoring failed. Showing unscored clips.');
+  });
+});
+
+describe('per-window timeout (10 s, default score 5, move on)', () => {
+  it('uses the spec values: 10 s per window and a 1024-token context', () => {
+    expect(WINDOW_TIMEOUT_MS).toBe(10_000);
+    expect(LLM_CONTEXT_WINDOW).toBe(1024);
+  });
+
+  it('withTimeout returns the value when the call settles in time', async () => {
+    await expect(withTimeout(Promise.resolve(7), 50)).resolves.toBe(7);
+  });
+
+  it('withTimeout rejects with ScoreTimeoutError and runs onTimeout', async () => {
+    let interrupted = 0;
+    const never = new Promise<number>(() => undefined);
+    await expect(withTimeout(never, 5, () => interrupted++)).rejects.toBeInstanceOf(ScoreTimeoutError);
+    expect(interrupted).toBe(1);
+  });
+
+  it('withTimeout passes through real errors without treating them as timeouts', async () => {
+    const boom = withTimeout(Promise.reject(new Error('device lost')), 50);
+    await expect(boom).rejects.toThrow('device lost');
+  });
+
+  it('a hung window scores the default 5, calls onTimeout, and is not retried', async () => {
+    let calls = 0;
+    let interrupted = 0;
+    const hang = async (): Promise<string> => {
+      calls++;
+      return new Promise<string>(() => undefined);
+    };
+    const r = await scoreWithRetry(hang, 'window text', {
+      timeoutMs: 5,
+      onTimeout: () => interrupted++,
+    });
+    expect(r.score).toBe(5);
+    expect(r.parsed).toBe(false);
+    expect(calls).toBe(1); // no temperature-0 retry: the wait is not doubled
+    expect(interrupted).toBe(1);
+  });
+
+  it('a slow-but-readable reply inside the limit is used normally', async () => {
+    const r = await scoreWithRetry(
+      async () => {
+        await new Promise((res) => setTimeout(res, 2));
+        return '{"score": 9, "reason": "ok"}';
+      },
+      'window text',
+      { timeoutMs: 500 },
+    );
+    expect(r.score).toBe(9);
+    expect(r.parsed).toBe(true);
+  });
+
+  it('a timeout on one window does not stop the next window from being scored', async () => {
+    // Mirrors the worker loop: each window gets its own scoreWithRetry call.
+    const windows = ['slow window', 'fast window'];
+    const results: number[] = [];
+    for (const text of windows) {
+      const r = await scoreWithRetry(
+        text === 'slow window'
+          ? () => new Promise<string>(() => undefined)
+          : async () => '{"score": 8, "reason": "good"}',
+        text,
+        { timeoutMs: 5 },
+      );
+      results.push(r.score);
+    }
+    expect(results).toEqual([5, 8]);
   });
 });
