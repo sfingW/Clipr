@@ -13,7 +13,9 @@ import {
   MAX_REASON_WORDS,
   TOP_N,
   WINDOW_TIMEOUT_MS,
+  CPU_WINDOW_TIMEOUT_MS,
   ScoreTimeoutError,
+  extractGeneratedText,
   withTimeout,
   buildScoringPrompt,
   describeLlmError,
@@ -232,7 +234,7 @@ describe('runScoring: happy path', () => {
     primeStore();
     const rec = recordStates();
     const deps: ScoringDeps = {
-      loadModel: async (onProgress) => onProgress(50, 'downloading'),
+      loadModel: async (report) => report({ pct: 50, note: 'downloading' }),
       score: async (cands, onProgress) =>
         cands.map((c, i) => {
           onProgress(i + 1, cands.length);
@@ -251,17 +253,37 @@ describe('runScoring: happy path', () => {
     expect([...scores].sort((a, b) => b - a)).toEqual(scores);
   });
 
-  it('does nothing when WebGPU is unavailable', async () => {
+  it('still runs when WebGPU is unavailable: the engine layer falls back to CPU', async () => {
     primeStore({ webgpu: 'unavailable' });
     let called = false;
     await runScoring(SRC, {
-      loadModel: async () => {
+      loadModel: async (report) => {
         called = true;
+        report({ engine: 'cpu', note: 'Loading AI on CPU (this may take a moment)...' });
       },
-      score: async (c) => c,
+      score: async (c) => c.map((x) => ({ ...x, score: 6, reason: 'ok', source: 'scored' as const })),
     });
-    expect(called).toBe(false);
-    expect(useAppStore.getState().jobState).toBe('ready');
+    expect(called).toBe(true);
+    const st = useAppStore.getState();
+    expect(st.jobState).toBe('ready');
+    expect(st.llm.engine).toBe('cpu');
+  });
+
+  it('reports the engine and fallback notes into the store', async () => {
+    primeStore();
+    const seen: Array<{ note: string | null; engine: string | null }> = [];
+    const unsub = useAppStore.subscribe((s) => seen.push({ note: s.llm.note, engine: s.llm.engine }));
+    await runScoring(SRC, {
+      loadModel: async (report) => {
+        report({ engine: 'webgpu', pct: 10, note: 'fetching' });
+        report({ engine: 'cpu', pct: 0, note: 'GPU crashed. Retrying on CPU (this may take a moment)...' });
+      },
+      score: async (c) => c.map((x) => ({ ...x, score: 4, reason: 'x', source: 'scored' as const })),
+    });
+    unsub();
+    expect(seen.some((x) => x.engine === 'webgpu' && x.note === 'fetching')).toBe(true);
+    expect(seen.some((x) => x.engine === 'cpu' && x.note?.startsWith('GPU crashed. Retrying on CPU'))).toBe(true);
+    expect(useAppStore.getState().llm.engine).toBe('cpu');
   });
 
   it('does nothing without a transcript', async () => {
@@ -348,6 +370,36 @@ describe('runScoring: source guard', () => {
     expect(st.source?.id).toBe('src-2');
     expect(st.candidates).toEqual([]);
     expect(st.llm.phase).toBe('idle');
+  });
+});
+
+describe('CPU engine: timeout and output shape', () => {
+  it('gives the CPU engine a longer window (60 s) than WebGPU (10 s)', () => {
+    expect(CPU_WINDOW_TIMEOUT_MS).toBe(60_000);
+    expect(CPU_WINDOW_TIMEOUT_MS).toBeGreaterThan(WINDOW_TIMEOUT_MS);
+  });
+
+  it('extracts the assistant reply from a chat-style generated_text', () => {
+    const out = [
+      {
+        generated_text: [
+          { role: 'user', content: 'score this' },
+          { role: 'assistant', content: '{"score": 8, "reason": "joke"}' },
+        ],
+      },
+    ];
+    expect(extractGeneratedText(out)).toBe('{"score": 8, "reason": "joke"}');
+  });
+
+  it('extracts a plain string generated_text', () => {
+    expect(extractGeneratedText([{ generated_text: 'hello' }])).toBe('hello');
+  });
+
+  it('returns an empty string for unexpected shapes, so the retry rules apply', () => {
+    expect(extractGeneratedText(undefined)).toBe('');
+    expect(extractGeneratedText([])).toBe('');
+    expect(extractGeneratedText([{ generated_text: 42 }])).toBe('');
+    expect(extractGeneratedText([{ generated_text: [] }])).toBe('');
   });
 });
 

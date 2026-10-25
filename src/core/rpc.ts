@@ -63,7 +63,8 @@ export interface AsrWorker {
 
 export interface LlmWorker {
   'llm.load': {
-    payload: { tier: 'full' | 'basic' };
+    /** engine: 'webllm' = WebGPU (default); 'transformers' = CPU/WASM fallback. */
+    payload: { tier: 'full' | 'basic'; engine?: 'webllm' | 'transformers' };
     result: void;
   };
   'llm.score': {

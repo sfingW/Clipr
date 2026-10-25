@@ -8,7 +8,6 @@
  * be unit tested in Node. The worker imports from here for the same logic.
  */
 import { useAppStore, type AppStore } from '../app/store';
-import type { RpcClient, LlmWorker } from '../core/rpc';
 import type { Candidate, SourceMeta } from '../core/types';
 import { chunkTranscript } from './chunking';
 
@@ -26,8 +25,14 @@ export const MAX_REASON_WORDS = 12;
  * default (4096) makes the KV cache too big for the GPU memory budget.
  */
 export const LLM_CONTEXT_WINDOW = 1024;
-/** Per-window limit for one `chat.completions.create` call. */
+/** Per-window limit for one WebGPU (WebLLM) `chat.completions.create` call. */
 export const WINDOW_TIMEOUT_MS = 10_000;
+/**
+ * Per-window limit on the CPU (Transformers.js WASM) engine. A 360M model on
+ * CPU needs several seconds per window, so the GPU limit would score everything
+ * at the default.
+ */
+export const CPU_WINDOW_TIMEOUT_MS = 60_000;
 
 /** Thrown by `withTimeout` when the call does not settle in time. */
 export class ScoreTimeoutError extends Error {
@@ -192,49 +197,43 @@ export function rankCandidates(candidates: Candidate[], topN: number = TOP_N): C
 // Orchestration (main thread)
 // ---------------------------------------------------------------------------
 
+/** Which engine is running: WebGPU (WebLLM) or CPU (Transformers.js WASM). */
+export type EngineLabel = 'webgpu' | 'cpu';
+
+/** Loading/fallback status reported by the engine layer. Every field is optional. */
+export type Report = (patch: { pct?: number; note?: string; engine?: EngineLabel }) => void;
+
 export interface ScoringDeps {
   /** Download/initialise the model. Resolves when it is ready to score. */
-  loadModel: (onProgress: (pct: number, note?: string) => void) => Promise<void>;
+  loadModel: (report: Report) => Promise<void>;
   /** Score every candidate. `onProgress` is called after each one. */
   score: (
     candidates: Candidate[],
     onProgress: (done: number, total: number) => void,
+    report: Report,
   ) => Promise<Candidate[]>;
 }
 
-/** Load and idle timeouts. The first load downloads hundreds of MB, so these are generous. */
-const LLM_IDLE_TIMEOUT_MS = 300_000;
-
-/** Production dependencies: the real LLM worker behind its RPC client. */
-export function defaultScoringDeps(llm: () => RpcClient<LlmWorker>): ScoringDeps {
-  return {
-    loadModel: (onProgress) =>
-      llm()
-        .request(
-          'llm.load',
-          { tier: 'full' },
-          {
-            timeoutMs: LLM_IDLE_TIMEOUT_MS,
-            resetOnProgress: true,
-            onProgress: (p) => onProgress(p.pct, p.note),
-          },
-        )
-        .then(() => undefined),
-    score: (candidates, onProgress) =>
-      llm().request(
-        'llm.score',
-        { candidates },
-        {
-          timeoutMs: LLM_IDLE_TIMEOUT_MS,
-          resetOnProgress: true,
-          onProgress: (p) => {
-            if (p.stage === 'scoring' && p.done !== undefined) {
-              onProgress(p.done, p.total ?? candidates.length);
-            }
-          },
-        },
-      ),
-  };
+/**
+ * Text of a Transformers.js text-generation result: a string, or a chat whose
+ * last message is the assistant reply. Returns '' for anything else, which the
+ * retry rules then treat as an unreadable reply.
+ */
+export function extractGeneratedText(out: unknown): string {
+  const first: unknown = Array.isArray(out) ? out[0] : out;
+  if (typeof first === 'string') return first;
+  if (!first || typeof first !== 'object') return '';
+  const gt = (first as { generated_text?: unknown }).generated_text;
+  if (typeof gt === 'string') return gt;
+  if (Array.isArray(gt) && gt.length > 0) {
+    const last: unknown = gt[gt.length - 1];
+    if (typeof last === 'string') return last;
+    if (last && typeof last === 'object') {
+      const content = (last as { content?: unknown }).content;
+      if (typeof content === 'string') return content;
+    }
+  }
+  return '';
 }
 
 /** Turn a model failure into a short, user-facing sentence (no raw engine text). */
@@ -276,6 +275,17 @@ export async function runScoring(
   const patchLlm = (patch: Parameters<AppStore['setLlm']>[0]): void => {
     if (isCurrent()) s().setLlm(patch);
   };
+  /** Engine progress and fallback notices. Keeps the engine label up to date. */
+  const report: Report = (p) => {
+    if (!isCurrent()) return;
+    const patch: Parameters<AppStore['setLlm']>[0] = {
+      phase: 'loading',
+      pct: p.pct ?? 0,
+      note: p.note ?? null,
+    };
+    if (p.engine !== undefined) patch.engine = p.engine;
+    s().setLlm(patch);
+  };
   const finish = (list: Candidate[]): void => {
     if (!isCurrent()) return;
     s().setCandidates(list);
@@ -284,7 +294,7 @@ export async function runScoring(
   };
 
   const transcript = s().transcript;
-  if (!isCurrent() || !transcript || s().webgpu !== 'available') return;
+  if (!isCurrent() || !transcript) return;
   if (s().jobState !== 'ready' && s().jobState !== 'candidates_ready') return;
 
   const windows = chunkTranscript(transcript);
@@ -293,7 +303,7 @@ export async function runScoring(
   patchLlm({ phase: 'loading', pct: 0, note: 'Preparing AI model', error: null, done: undefined, total: undefined });
 
   try {
-    await deps.loadModel((pct, note) => patchLlm({ phase: 'loading', pct, note: note ?? 'Downloading AI model' }));
+    await deps.loadModel(report);
   } catch (err) {
     if (!isCurrent()) return;
     console.warn('[clipr] AI scoring unavailable:', err);
@@ -309,11 +319,15 @@ export async function runScoring(
   }
 
   try {
-    const scored = await deps.score(windows, (done, total) => {
-      if (!isCurrent()) return;
-      if (s().jobState === 'llm_loading') advance('scoring');
-      patchLlm({ phase: 'scoring', pct: total > 0 ? (done / total) * 100 : 0, done, total, note: null });
-    });
+    const scored = await deps.score(
+      windows,
+      (done, total) => {
+        if (!isCurrent()) return;
+        if (s().jobState === 'llm_loading') advance('scoring');
+        patchLlm({ phase: 'scoring', pct: total > 0 ? (done / total) * 100 : 0, done, total, note: null });
+      },
+      report,
+    );
     if (!isCurrent()) return;
     patchLlm({ phase: 'ready', pct: 100, note: null, error: null, done: undefined, total: undefined });
     finish(rankCandidates(scored, TOP_N));
