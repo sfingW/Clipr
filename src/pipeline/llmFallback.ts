@@ -26,35 +26,41 @@ export const CPU_LOADING_NOTE = 'Loading AI on CPU (this may take a moment)...';
 const IDLE_TIMEOUT_MS = 300_000;
 
 /**
- * Errors that mean the WebGPU path is broken (device lost, GPU hang, out of GPU
- * memory, worker crash, idle timeout). Download and other errors are not GPU
- * failures, so they are not retried on CPU.
+ * Network and download failures. These are not GPU problems, and a CPU model
+ * would fetch the same files, so they are rethrown rather than retried.
  */
-const GPU_FAILURE = new RegExp(
-  [
-    'device.*lost',
-    'gpu timeout',
-    'mapAsync',
-    'GPUBuffer',
-    'command buffer',
-    'out of memory',
-    'insufficient memory',
-    'allocation failed',
-    'WEBGPU_UNAVAILABLE',
-    'webgpu',
-    'worker error',
-    'rpc timeout',
-  ].join('|'),
-  'i',
-);
+const DOWNLOAD_ERROR = /failed to fetch|networkerror|network error|err_network|err_internet|fetch failed|\b404\b|not found/i;
 
-export function isGpuFailure(err: unknown): boolean {
+/**
+ * Known GPU/engine failure texts. Matching these is a safety net only: on the
+ * WebGPU engine every non-download error already triggers the CPU fallback.
+ * Kept explicit so the cases we have seen in the field are documented.
+ */
+const KNOWN_GPU_FAILURE = /device.*lost|gpu timeout|mapAsync|GPUBuffer|command buffer|out of memory|has already been disposed|worker error|rpc timeout|webgpu/i;
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Should a failure on `engine` move the job to the CPU engine?
+ *
+ *  - WebGPU (webllm): yes, for any error except a download/network error.
+ *    A WebLLM crash can surface as an engine-internal message (for example
+ *    "Object has already been disposed"), so matching text alone misses it.
+ *  - CPU (transformers): never. There is no tier below it; the error goes to the
+ *    caller, which shows unscored clips.
+ */
+export function shouldFallBackToCpu(engine: EngineKind, err: unknown): boolean {
+  if (engine !== 'webllm') return false;
   // A dead worker (crash or messageerror) is a GPU failure on the WebGPU tier.
   // The name is checked, not instanceof, so this module stays free of runtime
   // imports from core/rpc.
   if (err instanceof Error && err.name === 'WorkerUnavailableError') return true;
-  const msg = err instanceof Error ? err.message : String(err);
-  return GPU_FAILURE.test(msg);
+  const msg = errorText(err);
+  if (KNOWN_GPU_FAILURE.test(msg)) return true;
+  if (DOWNLOAD_ERROR.test(msg)) return false;
+  return true;
 }
 
 export type SpawnFn = () => RpcClient<LlmWorker>;
@@ -103,7 +109,7 @@ export function createFallbackDeps(opts: FallbackOptions): ScoringDeps {
    * Returns the pre-warm promise, which resolves when the CPU model is ready.
    */
   const fallToCpu = (report: Report, err: unknown): Promise<void> => {
-    console.warn('[clipr] WebGPU AI failed; retrying on CPU:', err);
+    console.warn('[clipr] WebGPU AI failed; retrying on CPU:', errorText(err));
     opts.onFallback?.(err);
     report({ engine: 'cpu', pct: 0, note: GPU_FALLBACK_NOTE });
     const gpu = client;
@@ -120,7 +126,7 @@ export function createFallbackDeps(opts: FallbackOptions): ScoringDeps {
     try {
       await loadOn(report);
     } catch (err) {
-      if (kind !== 'webllm' || !isGpuFailure(err)) throw err;
+      if (!shouldFallBackToCpu(kind, err)) throw err;
       await fallToCpu(report, err);
     }
   };
@@ -151,7 +157,7 @@ export function createFallbackDeps(opts: FallbackOptions): ScoringDeps {
       try {
         return await scoreOn(candidates, onProgress);
       } catch (err) {
-        if (kind !== 'webllm' || !isGpuFailure(err)) throw err;
+        if (!shouldFallBackToCpu(kind, err)) throw err;
         // Partial GPU results are dropped: a crash can leave corrupted scores, so
         // the whole pass is re-run on CPU (mid-flight windows included).
         await fallToCpu(report, err);
