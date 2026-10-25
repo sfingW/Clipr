@@ -65,6 +65,12 @@ describe('isGpuFailure', () => {
     expect(isGpuFailure(new Error('WEBGPU_UNAVAILABLE: no gpu'))).toBe(true);
   });
 
+  it('treats a WorkerUnavailableError (crash signal) as a GPU failure', () => {
+    const e = new Error('worker error: anything');
+    e.name = 'WorkerUnavailableError';
+    expect(isGpuFailure(e)).toBe(true);
+  });
+
   it('does not treat download or unrelated errors as GPU failures', () => {
     expect(isGpuFailure(new Error('Failed to fetch'))).toBe(false);
     expect(isGpuFailure(new Error('something odd'))).toBe(false);
@@ -205,5 +211,49 @@ describe('createFallbackDeps: scoring', () => {
     await deps.loadModel(() => undefined);
     await deps.score([CAND], (d, t) => done.push([d, t]), () => undefined);
     expect(done).toEqual([[1, 1]]);
+  });
+});
+
+describe('GPU to CPU handoff order (pre-warm)', () => {
+  it('spawns the WASM worker and starts its model load before the GPU client is terminated', async () => {
+    const events: string[] = [];
+    const gpu = fakeClient({
+      load: async () => {
+        throw new Error('worker error: Device was lost');
+      },
+    });
+    const cpu = fakeClient();
+    // Record the order of the key steps, using the fakes' own hooks.
+    const gpuTerm = gpu.client.terminate;
+    gpu.client.terminate = () => {
+      events.push('terminate:gpu');
+      gpuTerm();
+    };
+    const cpuReq = cpu.client.request;
+    cpu.client.request = ((type: string, payload: unknown, o: unknown) => {
+      events.push(`request:${type}`);
+      return cpuReq(type as never, payload as never, o as never);
+    }) as never;
+    const spawn = vi.fn(() => {
+      events.push('spawn');
+      return spawn.mock.calls.length === 1 ? gpu.client : cpu.client;
+    });
+    const deps = createFallbackDeps({ preferWebGpu: true, spawn });
+    await deps.loadModel(() => undefined);
+
+    expect(events).toEqual(['spawn', 'spawn', 'request:llm.load', 'terminate:gpu']);
+  });
+
+  it('a crash that already disposed the GPU client still hands off cleanly', async () => {
+    const gpu = fakeClient({
+      load: async () => {
+        throw new Error('worker error: Device was lost');
+      },
+    });
+    const cpu = fakeClient();
+    const spawn = vi.fn().mockReturnValueOnce(gpu.client).mockReturnValueOnce(cpu.client);
+    const deps = createFallbackDeps({ preferWebGpu: true, spawn });
+    await expect(deps.loadModel(() => undefined)).resolves.toBeUndefined();
+    expect(cpu.log).toEqual([{ type: 'llm.load', engine: 'transformers' }]);
   });
 });

@@ -144,8 +144,23 @@ export type ProgressHandler = (p: Progress) => void;
 export interface RpcClientOptions {
   timeouts?: Record<string, number>;
   defaultTimeoutMs?: number;
+  /** Called once when the worker crashes (not on a deliberate terminate). */
   onCrash?: (error: Error) => void;
 }
+
+/**
+ * The worker is gone: it crashed, or the client was terminated. Every pending
+ * request rejects with this, and so does any request made afterwards.
+ */
+export class WorkerUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkerUnavailableError';
+  }
+}
+
+/** live → shutting_down → dead. Teardown only ever moves forward. */
+export type RpcStatus = 'live' | 'shutting_down' | 'dead';
 
 export interface RpcClient<M extends { [K in keyof M]: MethodShape }> {
   request<K extends keyof M & string>(
@@ -166,7 +181,9 @@ export interface RpcClient<M extends { [K in keyof M]: MethodShape }> {
   sendStream(msg: StreamMessage): void;
   onStream(handler: StreamHandler): () => void;
   onProgress(handler: ProgressHandler): () => void;
+  /** Idempotent. Safe to call any number of times, in any order with a crash. */
   terminate(): void;
+  readonly status: RpcStatus;
 }
 
 interface Pending {
@@ -194,6 +211,9 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
   const timeouts = { ...DEFAULT_TIMEOUTS_MS, ...options.timeouts };
   const defaultTimeout = options.defaultTimeoutMs ?? 60_000;
 
+  let status: RpcStatus = 'live';
+  let workerRef: Worker | null = worker;
+
   const cleanup = (id: string): Pending | undefined => {
     const p = pending.get(id);
     if (p?.timer) clearTimeout(p.timer);
@@ -209,7 +229,7 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
     }, ms);
   };
 
-  worker.addEventListener('message', (event: MessageEvent<unknown>) => {
+  const onMessage = (event: MessageEvent<unknown>): void => {
     const msg = event.data as
       | Response<string, unknown>
       | Progress
@@ -237,20 +257,55 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
     if (!p) return;
     if (resp.ok) p.resolve(resp.result);
     else p.reject(rpcError(resp.error));
-  });
+  };
 
-  worker.addEventListener('error', (event) => {
-    const error = new Error(`worker error: ${event.message}`);
-    options.onCrash?.(error);
+  // A crash can arrive as several signals (worker.onerror, messageerror, and the
+  // rejection of the in-flight request). Each one calls dispose(); only the first
+  // does any work.
+  const onError = (event: ErrorEvent): void => {
+    dispose(new WorkerUnavailableError(`worker error: ${event.message}`), true);
+  };
+  const onMessageError = (): void => {
+    dispose(new WorkerUnavailableError('worker error: message could not be deserialized'), true);
+  };
+
+  /**
+   * Idempotent teardown. Rejects every pending request with `reason`, detaches
+   * the listeners, terminates the worker, and drops the reference. `crashed`
+   * reports the crash through `onCrash`.
+   */
+  const dispose = (reason: WorkerUnavailableError, crashed: boolean): void => {
+    if (status !== 'live') return;
+    status = 'shutting_down';
     for (const [, p] of pending) {
       if (p.timer) clearTimeout(p.timer);
-      p.reject(error);
+      p.reject(reason);
     }
     pending.clear();
-  });
+    const w = workerRef;
+    if (w) {
+      w.removeEventListener('message', onMessage as EventListener);
+      w.removeEventListener('error', onError as EventListener);
+      w.removeEventListener('messageerror', onMessageError as EventListener);
+      w.terminate();
+    }
+    status = 'dead';
+    workerRef = null;
+    if (crashed) options.onCrash?.(reason);
+  };
+
+  worker.addEventListener('message', onMessage as EventListener);
+  worker.addEventListener('error', onError as EventListener);
+  worker.addEventListener('messageerror', onMessageError as EventListener);
 
   return {
+    get status() {
+      return status;
+    },
     request(type, payload, opts) {
+      if (status !== 'live' || !workerRef) {
+        return Promise.reject(new WorkerUnavailableError(`worker unavailable: ${type} (client ${status})`));
+      }
       const id = opts?.requestId ?? crypto.randomUUID();
       const timeoutMs = opts?.timeoutMs ?? timeouts[type] ?? defaultTimeout;
       return new Promise((resolve, reject) => {
@@ -264,15 +319,16 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
         };
         armTimer(id, entry, timeoutMs);
         pending.set(id, entry);
-        worker.postMessage({ id, type, payload } satisfies Request<string, unknown>);
+        workerRef?.postMessage({ id, type, payload } satisfies Request<string, unknown>);
       });
     },
     sendStream(msg) {
+      if (!workerRef) return;
       const transfer: Transferable[] = [];
       if (msg.kind === 'videoBatch') transfer.push(...msg.frames);
       else if (msg.kind === 'audioPcmBatch') transfer.push(...msg.items);
       else if (msg.kind === 'audioRemux') transfer.push(msg.audio.buffer);
-      worker.postMessage(msg, transfer);
+      workerRef.postMessage(msg, transfer);
     },
     onStream(handler) {
       streamHandlers.add(handler);
@@ -283,12 +339,7 @@ export function createRpcClient<M extends { [K in keyof M]: MethodShape }>(
       return () => progressHandlers.delete(handler);
     },
     terminate() {
-      for (const [, p] of pending) {
-        if (p.timer) clearTimeout(p.timer);
-        p.reject(new Error('worker terminated'));
-      }
-      pending.clear();
-      worker.terminate();
+      dispose(new WorkerUnavailableError('worker terminated by caller'), false);
     },
   };
 }
