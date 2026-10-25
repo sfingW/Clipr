@@ -49,6 +49,10 @@ const GPU_FAILURE = new RegExp(
 );
 
 export function isGpuFailure(err: unknown): boolean {
+  // A dead worker (crash or messageerror) is a GPU failure on the WebGPU tier.
+  // The name is checked, not instanceof, so this module stays free of runtime
+  // imports from core/rpc.
+  if (err instanceof Error && err.name === 'WorkerUnavailableError') return true;
   const msg = err instanceof Error ? err.message : String(err);
   return GPU_FAILURE.test(msg);
 }
@@ -69,9 +73,8 @@ export function createFallbackDeps(opts: FallbackOptions): ScoringDeps {
 
   const label = (): EngineLabel => (kind === 'webllm' ? 'webgpu' : 'cpu');
 
-  /** Terminate the current worker (if any) and start a new one on `next`. */
-  const respawn = (next: EngineKind): void => {
-    client?.terminate();
+  /** Start a brand-new worker for `next`. Never reuse a crashed one. */
+  const start = (next: EngineKind): void => {
     client = opts.spawn();
     kind = next;
     loaded = false;
@@ -92,24 +95,33 @@ export function createFallbackDeps(opts: FallbackOptions): ScoringDeps {
     loaded = true;
   };
 
-  /** Switch to CPU after a GPU failure and tell the UI why. */
-  const fallToCpu = (report: Report, err: unknown): void => {
+  /**
+   * Hand off from the crashed WebGPU worker to a new CPU worker. Order matters
+   * for latency: the WASM worker is spawned and its model load starts first
+   * (the pre-warm); the dead GPU client is disposed in the same tick. Both
+   * steps are sync, so the disposal does not hold up the download.
+   * Returns the pre-warm promise, which resolves when the CPU model is ready.
+   */
+  const fallToCpu = (report: Report, err: unknown): Promise<void> => {
     console.warn('[clipr] WebGPU AI failed; retrying on CPU:', err);
     opts.onFallback?.(err);
     report({ engine: 'cpu', pct: 0, note: GPU_FALLBACK_NOTE });
-    respawn('transformers');
+    const gpu = client;
+    start('transformers');
+    report({ engine: 'cpu', pct: 0, note: CPU_LOADING_NOTE });
+    const warm = loadOn(report);
+    gpu?.terminate(); // idempotent: a crash may already have disposed it
+    return warm;
   };
 
   const loadWithFallback = async (report: Report): Promise<void> => {
-    if (!client) respawn(kind);
+    if (!client) start(kind);
     if (kind === 'transformers') report({ engine: 'cpu', pct: 0, note: CPU_LOADING_NOTE });
     try {
       await loadOn(report);
     } catch (err) {
       if (kind !== 'webllm' || !isGpuFailure(err)) throw err;
-      fallToCpu(report, err);
-      report({ engine: 'cpu', pct: 0, note: CPU_LOADING_NOTE });
-      await loadOn(report);
+      await fallToCpu(report, err);
     }
   };
 
@@ -140,9 +152,9 @@ export function createFallbackDeps(opts: FallbackOptions): ScoringDeps {
         return await scoreOn(candidates, onProgress);
       } catch (err) {
         if (kind !== 'webllm' || !isGpuFailure(err)) throw err;
-        fallToCpu(report, err);
-        report({ engine: 'cpu', pct: 0, note: CPU_LOADING_NOTE });
-        await loadOn(report);
+        // Partial GPU results are dropped: a crash can leave corrupted scores, so
+        // the whole pass is re-run on CPU (mid-flight windows included).
+        await fallToCpu(report, err);
         return scoreOn(candidates, onProgress);
       }
     },

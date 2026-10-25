@@ -32,6 +32,9 @@ class Endpoint {
   emit(type: string, ev: { data?: unknown; message?: string }): void {
     for (const fn of this.listeners.get(type) ?? []) fn(ev);
   }
+  removeEventListener(type: string, fn: Listener): void {
+    this.listeners.get(type)?.delete(fn);
+  }
   terminate(): void {
     /* no-op */
   }
