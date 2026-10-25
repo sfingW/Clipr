@@ -4,8 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node scripts/copy-ort.mjs && node scripts/copy-mediapipe.mjs && vite",
-    "build": "node scripts/copy-ort.mjs && node scripts/copy-mediapipe.mjs && vite build",
+    "dev": "node scripts/copy-ort.mjs && vite",
+    "build": "node scripts/copy-ort.mjs && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

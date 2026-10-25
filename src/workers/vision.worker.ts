@@ -28,9 +28,13 @@ const MIN_CONFIDENCE = 0.5;
  */
 const LATE_BATCH_GRACE_MS = 500;
 
-/** Self-hosted by scripts/copy-mediapipe.mjs into public/mediapipe/, never a CDN. */
-export const WASM_PATH = '/mediapipe/wasm';
-export const MODEL_PATH = '/mediapipe/face_detection_short_range.tflite';
+/**
+ * Loaded from CDNs, pinned to the installed @mediapipe/tasks-vision version (1.1.1).
+ * Both hosts send Access-Control-Allow-Origin: *, so they pass the COEP require-corp policy.
+ */
+export const WASM_PATH = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm';
+export const MODEL_PATH =
+  'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite';
 
 type VideoBatch = Extract<StreamMessage, { kind: 'videoBatch' }>;
 
@@ -40,17 +44,22 @@ function loadDetector(): Promise<FaceDetector> {
   if (detectorPromise) return detectorPromise;
   const p = (async (): Promise<FaceDetector> => {
     console.log('[clipr] Initializing MediaPipe WASM from:', WASM_PATH);
-    const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
-    return FaceDetector.createFromOptions(fileset, {
-      baseOptions: {
-        modelAssetPath: MODEL_PATH,
-        // CPU on purpose: the GPU delegate is the path that loses devices on
-        // some Macs, and this pass is small.
-        delegate: 'CPU',
-      },
-      runningMode: 'IMAGE',
-      minDetectionConfidence: MIN_CONFIDENCE,
-    });
+    try {
+      const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+      return await FaceDetector.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: MODEL_PATH,
+          // CPU on purpose: the GPU delegate is the path that loses devices on
+          // some Macs, and this pass is small.
+          delegate: 'CPU',
+        },
+        runningMode: 'IMAGE',
+        minDetectionConfidence: MIN_CONFIDENCE,
+      });
+    } catch (err) {
+      console.error('[clipr] MediaPipe init error:', err);
+      throw err;
+    }
   })();
   detectorPromise = p;
   p.catch(() => {
