@@ -9,7 +9,7 @@
  */
 import { CreateMLCEngine, type MLCEngine } from '@mlc-ai/web-llm';
 import { serveRpc, type LlmWorker as LlmMethods, type RpcServerContext } from '../core/rpc';
-import { scoreWithRetry, MAX_TOKENS } from '../pipeline/scoring';
+import { scoreWithRetry, LLM_CONTEXT_WINDOW, MAX_TOKENS } from '../pipeline/scoring';
 
 /** SPEC §8.6 / §11: the full-tier scoring model. */
 export const LLM_MODEL_ID = 'SmolLM2-360M-Instruct-q4f16_1-MLC';
@@ -24,14 +24,19 @@ function loadEngine(ctx: RpcServerContext): Promise<MLCEngine> {
       throw new Error('WEBGPU_UNAVAILABLE: navigator.gpu is missing in this worker');
     }
     ctx.progress(0, { stage: 'llm_loading', note: 'loading model' });
-    return CreateMLCEngine(LLM_MODEL_ID, {
-      initProgressCallback: (report) => {
-        ctx.progress(Math.min(99, Math.round(report.progress * 100)), {
-          stage: 'llm_loading',
-          note: report.text,
-        });
+    return CreateMLCEngine(
+      LLM_MODEL_ID,
+      {
+        initProgressCallback: (report) => {
+          ctx.progress(Math.min(99, Math.round(report.progress * 100)), {
+            stage: 'llm_loading',
+            note: report.text,
+          });
+        },
       },
-    });
+      // Smaller KV cache: the model's default window (4096) exhausts GPU memory.
+      { context_window_size: LLM_CONTEXT_WINDOW },
+    );
   })();
   enginePromise = p;
   p.catch(() => {
@@ -50,6 +55,9 @@ async function score(
 
   for (let i = 0; i < total; i++) {
     const c = payload.candidates[i];
+    // Each window is scored in isolation: no chat history carries over, so the
+    // KV cache never grows across the ~170 windows of a long video.
+    await engine.resetChat();
     const generate = async (prompt: string, temperature: number): Promise<string> => {
       const reply = await engine.chat.completions.create({
         messages: [{ role: 'user', content: prompt }],
@@ -58,7 +66,12 @@ async function score(
       });
       return reply.choices[0]?.message?.content ?? '';
     };
-    const result = await scoreWithRetry(generate, c.text);
+    // A stalled window is interrupted and scored at the default, so the job moves on.
+    const result = await scoreWithRetry(generate, c.text, {
+      onTimeout: () => {
+        void engine.interruptGenerate().catch(() => undefined);
+      },
+    });
     out.push({ ...c, score: result.score, reason: result.reason, source: 'scored' });
     ctx.progress(Math.round(((i + 1) / total) * 100), { stage: 'scoring', done: i + 1, total });
   }

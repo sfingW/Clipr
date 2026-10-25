@@ -20,6 +20,50 @@ export const TOP_N = 8;
 /** Used when the model's output cannot be read even after the retry. */
 export const DEFAULT_SCORE = 5;
 export const MAX_REASON_WORDS = 12;
+/**
+ * Context window for the scoring engine. A window is ~40 s of speech (≈150
+ * tokens) plus the prompt and a 60-token reply, so 1024 is ample. The model's
+ * default (4096) makes the KV cache too big for the GPU memory budget.
+ */
+export const LLM_CONTEXT_WINDOW = 1024;
+/** Per-window limit for one `chat.completions.create` call. */
+export const WINDOW_TIMEOUT_MS = 10_000;
+
+/** Thrown by `withTimeout` when the call does not settle in time. */
+export class ScoreTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`score timeout after ${ms}ms`);
+    this.name = 'ScoreTimeoutError';
+  }
+}
+
+export function isScoreTimeout(err: unknown): boolean {
+  return err instanceof ScoreTimeoutError;
+}
+
+/**
+ * Race `p` against a timer. On timeout, `onTimeout` runs (the worker uses it to
+ * interrupt the stuck generation) and the promise rejects with ScoreTimeoutError.
+ * A late settlement of `p` is ignored.
+ */
+export function withTimeout<T>(p: Promise<T>, ms: number, onTimeout?: () => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new ScoreTimeoutError(ms));
+    }, ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e: unknown) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
 
 /** Prompt template from SPEC §8.6 — "final, do not soften". Only {text} varies. */
 export function buildScoringPrompt(text: string): string {
@@ -97,15 +141,36 @@ export function parseScore(raw: string): ParsedScore | null {
 /** One generation call. Errors from the engine (not parse failures) propagate. */
 export type GenerateFn = (prompt: string, temperature: number) => Promise<string>;
 
+export interface ScoreOptions {
+  /** Per-call limit. Defaults to WINDOW_TIMEOUT_MS. */
+  timeoutMs?: number;
+  /** Called when a call times out, e.g. to interrupt the engine. */
+  onTimeout?: () => void;
+}
+
 /**
  * Score one window (SPEC §8.6): temperature 0.2, then one retry at 0 if the
- * reply is unreadable, then the default score of 5. Engine errors are not
- * swallowed here, so the caller can degrade the whole run.
+ * reply is unreadable, then the default score of 5. A timed-out call returns the
+ * default at once (no retry, so a stalled window cannot double its wait). Other
+ * engine errors propagate, so the caller can degrade the whole run.
  */
-export async function scoreWithRetry(generate: GenerateFn, text: string): Promise<ScoreResult> {
+export async function scoreWithRetry(
+  generate: GenerateFn,
+  text: string,
+  opts: ScoreOptions = {},
+): Promise<ScoreResult> {
   const prompt = buildScoringPrompt(text);
+  const timeoutMs = opts.timeoutMs ?? WINDOW_TIMEOUT_MS;
   for (const temperature of [SCORE_TEMPERATURE, RETRY_TEMPERATURE]) {
-    const raw = await generate(prompt, temperature);
+    let raw: string;
+    try {
+      raw = await withTimeout(generate(prompt, temperature), timeoutMs, opts.onTimeout);
+    } catch (err) {
+      if (isScoreTimeout(err)) {
+        return { score: DEFAULT_SCORE, reason: 'Scoring timed out; default score.', parsed: false };
+      }
+      throw err;
+    }
     const parsed = parseScore(raw);
     if (parsed) return { ...parsed, parsed: true };
   }
