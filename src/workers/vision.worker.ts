@@ -13,9 +13,31 @@
  * incoming batches until the stream ends (`last`) or is aborted, and only then
  * rejects the request. Frames are never left for the garbage collector.
  */
-import { FaceDetector, FilesetResolver } from '@mediapipe/tasks-vision';
 import { serveRpc, type VisionWorker as VisionMethods, type RpcServerContext, type StreamMessage } from '../core/rpc';
 import type { FaceBox, FaceSample } from '../core/types';
+
+/**
+ * MediaPipe tasks-vision 1.1.1 as a pre-bundled ES module from jsDelivr (`+esm`).
+ * Loaded at runtime rather than from npm, so Vite never bundles it. The worker
+ * is built as a classic (IIFE) script, which cannot hold a static import; a
+ * dynamic import() is valid there.
+ */
+export const MEDIAPIPE_ESM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/+esm';
+
+/** The subset of the MediaPipe API used here. */
+interface MpDetection {
+  boundingBox?: { originX: number; originY: number; width: number; height: number };
+  categories: { score: number }[];
+}
+interface FaceDetector {
+  detect(image: CanvasImageSource): { detections: MpDetection[] };
+}
+interface MediapipeModule {
+  FilesetResolver: { forVisionTasks(basePath: string): Promise<unknown> };
+  FaceDetector: {
+    createFromOptions(fileset: unknown, options: Record<string, unknown>): Promise<FaceDetector>;
+  };
+}
 
 /** SPEC §8.8: sample every 3rd frame, at most 320 px wide. */
 export const SAMPLE_EVERY = 3;
@@ -45,12 +67,18 @@ function loadDetector(): Promise<FaceDetector> {
   const p = (async (): Promise<FaceDetector> => {
     console.log('[clipr] Initializing MediaPipe WASM from:', WASM_PATH);
     try {
-      const fileset = await FilesetResolver.forVisionTasks(WASM_PATH);
+      const mp = (await import(/* @vite-ignore */ MEDIAPIPE_ESM_URL)) as MediapipeModule;
+      if (!mp || !mp.FilesetResolver || !mp.FaceDetector) {
+        throw new Error(
+          `[clipr] MediaPipe module at ${MEDIAPIPE_ESM_URL} did not export FilesetResolver/FaceDetector`,
+        );
+      }
+      const fileset = await mp.FilesetResolver.forVisionTasks(WASM_PATH);
       console.log(
         '[clipr] FilesetResolver loaded. globalThis.ModuleFactory is:',
         typeof (globalThis as { ModuleFactory?: unknown }).ModuleFactory,
       );
-      return await FaceDetector.createFromOptions(fileset, {
+      return await mp.FaceDetector.createFromOptions(fileset, {
         baseOptions: {
           modelAssetPath: MODEL_PATH,
           // CPU on purpose: the GPU delegate is the path that loses devices on
